@@ -502,7 +502,10 @@ func saveConfigLoop(cfgFile string) {
 		err = osutil.Rename(cfgFile+".tmp", cfgFile)
 		if err != nil {
 			l.Warnln(err)
+			continue
 		}
+
+		go restart()
 	}
 }
 
