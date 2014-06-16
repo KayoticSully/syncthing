@@ -1,3 +1,7 @@
+// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
+// Use of this source code is governed by an MIT-style license that can be
+// found in the LICENSE file.
+
 package protocol
 
 import (
@@ -18,6 +22,31 @@ func TestHeaderFunctions(t *testing.T) {
 	}
 	if err := quick.Check(f, nil); err != nil {
 		t.Error(err)
+	}
+}
+
+func TestHeaderLayout(t *testing.T) {
+	var e, a uint32
+
+	// Version are the first four bits
+	e = 0xf0000000
+	a = encodeHeader(header{0xf, 0, 0})
+	if a != e {
+		t.Errorf("Header layout incorrect; %08x != %08x", a, e)
+	}
+
+	// Message ID are the following 12 bits
+	e = 0x0fff0000
+	a = encodeHeader(header{0, 0xfff, 0})
+	if a != e {
+		t.Errorf("Header layout incorrect; %08x != %08x", a, e)
+	}
+
+	// Type are the last 8 bits before reserved
+	e = 0x0000ff00
+	a = encodeHeader(header{0, 0, 0xff})
+	if a != e {
+		t.Errorf("Header layout incorrect; %08x != %08x", a, e)
 	}
 }
 

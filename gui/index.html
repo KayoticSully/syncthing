@@ -1,4 +1,9 @@
 <!DOCTYPE html>
+<!--
+Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
+Use of this source code is governed by an MIT-style license that can be
+found in the LICENSE file.
+-->
 <html lang="en" ng-app="syncthing" ng-controller="SyncthingCtrl" class="ng-cloak">
 <head>
   <meta charset="utf-8">
@@ -60,12 +65,25 @@
     }
 
     .table th {
-      white-space:nowrap;
+      white-space: nowrap;
       font-weight: 400;
     }
 
     .table td {
       padding-left: 20px !important;
+    }
+
+    .table td.small-data {
+      white-space: nowrap;
+    }
+
+    @media (max-width:767px) {
+      .table-responsive>.table>tbody>tr>td {
+        /* revert a bootstrap setting e.g.:
+         * for mobile phones to allow linebreaks in long repro folder/shared with
+         * columns. */
+        white-space: normal;
+      }
     }
   </style>
 </head>
@@ -125,13 +143,13 @@
           <div class="panel panel-{{repoClass(repo.ID)}}" ng-repeat="repo in repoList()">
             <div class="panel-heading">
               <h3 class="panel-title">
-                <a data-toggle="collapse" data-parent="#repositories" href="#repo-{{repo.ID | clean}}">
+                <a data-toggle="collapse" data-parent="#repositories" href="#repo-{{$index}}">
                   <span class="glyphicon glyphicon-hdd"></span> {{repo.Directory | shortPath}}
                   <span class="pull-right hidden-xs">{{repoStatus(repo.ID)}}</span>
                 </a>
               </h3>
             </div>
-            <div id="repo-{{repo.ID | clean}}" class="panel-collapse collapse">
+            <div id="repo-{{$index}}" class="panel-collapse collapse">
               <div class="panel-body">
                 <div class="table-responsive">
                   <table class="table table-condensed table-striped">
@@ -154,15 +172,18 @@
                       </tr>
                       <tr>
                         <th><span class="glyphicon glyphicon-globe"></span>&emsp;Global Repository</th>
-                        <td class="text-right">{{model[repo.ID].globalFiles | alwaysNumber}} files, {{model[repo.ID].globalBytes | binary}}B</td>
+                        <td class="text-right">{{model[repo.ID].globalFiles | alwaysNumber}} items, {{model[repo.ID].globalBytes | binary}}B</td>
                       </tr>
                       <tr>
                         <th><span class="glyphicon glyphicon-home"></span>&emsp;Local Repository</th>
-                        <td class="text-right">{{model[repo.ID].localFiles | alwaysNumber}} files, {{model[repo.ID].localBytes | binary}}B</td>
+                        <td class="text-right">{{model[repo.ID].localFiles | alwaysNumber}} items, {{model[repo.ID].localBytes | binary}}B</td>
                       </tr>
                       <tr>
                         <th><span class="glyphicon glyphicon-cloud-download"></span>&emsp;Out of Sync</th>
-                        <td class="text-right">{{model[repo.ID].needFiles | alwaysNumber}} files, {{model[repo.ID].needBytes | binary}}B</td>
+                        <td class="text-right">
+                        <a ng-if="model[repo.ID].needFiles > 0" ng-click="showNeed(repo.ID)" href="">{{model[repo.ID].needFiles | alwaysNumber}} items, {{model[repo.ID].needBytes | binary}}B</a>
+                        <span ng-if="model[repo.ID].needFiles == 0">0 items, 0 B</span>
+                        </td>
                       </tr>
                       <tr>
                         <th><span class="glyphicon glyphicon-lock"></span>&emsp;Master Repository</th>
@@ -185,7 +206,10 @@
                     </tbody>
                   </table>
                 </div>
-                <span class="pull-right"><a class="btn btn-sm btn-primary" href="" ng-click="editRepo(repo)"><span class="glyphicon glyphicon-pencil"></span>&emsp;Edit</a></span>
+                <span class="pull-right">
+                  <a class="btn btn-sm btn-primary" href="" ng-click="editRepo(repo)"><span class="glyphicon glyphicon-pencil"></span>&emsp;Edit</a>
+                  <a class="btn btn-sm btn-danger" ng-if="repo.ReadOnly && model[repo.ID].needFiles > 0" ng-click="override(repo.ID)" href=""><span class="glyphicon glyphicon-upload"></span>&emsp;Override Changes</a>
+                </span>
               </div>
             </div>
           </div>
@@ -199,10 +223,10 @@
           <div class="panel panel-default" ng-repeat="nodeCfg in [thisNode()]">
             <div class="panel-heading">
               <h3 class="panel-title">
-                <a data-toggle="collapse" data-parent="#nodes" href="#node-{{nodeCfg.NodeID | clean}}"><span class="glyphicon glyphicon-home"></span> {{nodeName(nodeCfg)}}</a>
+                <a data-toggle="collapse" data-parent="#nodes" href="#node-this"><span class="glyphicon glyphicon-home"></span> {{nodeName(nodeCfg)}}</a>
               </h3>
             </div>
-            <div id="node-{{nodeCfg.NodeID | clean}}" class="panel-collapse collapse in">
+            <div id="node-this" class="panel-collapse collapse in">
               <div class="panel-body">
                 <div class="table-responsive">
                   <table class="table table-condensed table-striped">
@@ -245,14 +269,14 @@
           <div class="panel panel-{{nodeClass(nodeCfg)}}" ng-repeat="nodeCfg in otherNodes()">
             <div class="panel-heading">
               <h3 class="panel-title">
-                <a data-toggle="collapse" data-parent="#nodes" href="#node-{{nodeCfg.NodeID}}">
+                <a data-toggle="collapse" data-parent="#nodes" href="#node-{{$index}}">
                   <span class="glyphicon glyphicon-retweet"></span>
                   {{nodeName(nodeCfg)}}
                   <span class="pull-right hidden-xs">{{nodeStatus(nodeCfg)}}</span>
                 </a>
               </h3>
             </div>
-            <div id="node-{{nodeCfg.NodeID}}" class="panel-collapse collapse">
+            <div id="node-{{$index}}" class="panel-collapse collapse">
               <div class="panel-body">
                 <div class="table-responsive">
                   <table class="table table-condensed table-striped">
@@ -394,9 +418,7 @@
           </h4>
         </div>
         <div class="modal-body">
-          <div class="well well-sm text-monospace text-center">
-            {{myID | chunkID}}
-          </div>
+          <div class="well well-sm text-monospace text-center">{{myID | chunkID}}</div>
           <img ng-if="myID" class="center-block img-thumbnail" src="qr/{{myID | chunkID}}"/>
         </div>
         <div class="modal-footer">
@@ -430,7 +452,7 @@
               </p>
             </div>
             <div class="form-group">
-              <label for="name">Name</label>
+              <label for="name">Node Name</label>
               <input placeholder="Home Server" id="name" class="form-control" type="text" ng-model="currentNode.Name"></input>
               <p class="help-block">Shown instead of Node ID in the cluster status.</p>
             </div>
@@ -465,7 +487,7 @@
               <div class="col-md-12">
                 <div class="form-group" ng-class="{'has-error': repoEditor.repoID.$invalid && repoEditor.repoID.$dirty}">
                   <label for="repoID">Repository ID</label>
-                  <input name="repoID" placeholder="documents" ng-disabled="editingExisting" id="repoID" class="form-control" type="text" ng-model="currentRepo.ID" required unique-repo ng-pattern="/^[a-zaZ0-9-_.]{1,64}$/"></input>
+                  <input name="repoID" placeholder="documents" ng-disabled="editingExisting" id="repoID" class="form-control" type="text" ng-model="currentRepo.ID" required unique-repo ng-pattern="/^[a-zA-Z0-9-_.]{1,64}$/"></input>
                   <p class="help-block">
                     <span ng-if="repoEditor.repoID.$valid || repoEditor.repoID.$pristine">Short identifier for the repository. Must be the same on all cluster nodes.</span>
                     <span ng-if="repoEditor.repoID.$error.uniqueRepo">The repository ID must be unique.</span>
@@ -502,7 +524,7 @@
                   <p class="help-block">File permission bits are ignored when looking for changes. Use on FAT filesystems.</p>
                 </div>
                 <div class="form-group">
-                  <label for="nodes">Nodes</label>
+                  <label for="nodes">Share With Nodes</label>
                   <div class="checkbox" ng-repeat="node in otherNodes()">
                     <label>
                       <input type="checkbox" ng-model="currentRepo.selectedNodes[node.NodeID]"> {{nodeName(node)}}
@@ -552,7 +574,7 @@
     <div class="modal-dialog modal-lg">
       <div class="modal-content">
         <div class="modal-header">
-          <h4 class="modal-title"> Settings</h4>
+          <h4 class="modal-title">Settings</h4>
         </div>
         <div class="modal-body">
           <form role="form">
@@ -581,6 +603,11 @@
                       {{setting.descr}} <input id="{{setting.id}}" type="checkbox" ng-model="config.workingGUI[setting.id]"></input>
                     </label>
                   </div>
+                  <div ng-if="setting.type == 'apikey'">
+                    <label>{{setting.descr}} (<a href="http://discourse.syncthing.net/t/v0-8-14-api-keys/335">Usage</a>)</label>
+                    <div class="well well-sm text-monospace">{{config.workingGUI[setting.id] || "-"}}</div>
+                    <button type="button" class="btn btn-sm btn-default" ng-click="setAPIKey(config.workingGUI)">Generate</button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -588,6 +615,56 @@
         </div>
         <div class="modal-footer">
           <button type="button" class="btn btn-primary" ng-click="saveSettings()"><span class="glyphicon glyphicon-ok"></span>&emsp;Save</button>
+          <button type="button" class="btn btn-default" data-dismiss="modal"><span class="glyphicon glyphicon-remove"></span>&emsp;Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Usage report modal -->
+
+  <div id="ur" class="modal fade">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <div class="modal-header alert alert-success">
+          <h4 class="modal-title">Allow Anonymous Usage Reporting?</h4>
+        </div>
+        <div class="modal-body">
+        <p>
+        The encrypted usage report is sent daily. It is used to track common platforms, repo sizes and app versions. If the reported data set is changed you will be prompted with this dialog again.
+        </p>
+        <p>
+        The aggregated statistics are publicly available at <a href="https://data.syncthing.net/">https://data.syncthing.net/</a>.
+        </p>
+        <button type="button" class="btn btn-default" ng-show="!reportPreview" ng-click="reportPreview = true">Preview Usage Report</button>
+        <pre ng-if="reportPreview"><small>{{reportData | json}}</small></pre>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-success" ng-click="acceptUR()"><span class="glyphicon glyphicon-ok"></span>&emsp;Yes</button>
+          <button type="button" class="btn btn-danger" ng-click="declineUR()"><span class="glyphicon glyphicon-remove"></span>&emsp;No</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Needed files modal -->
+
+  <div id="needed" class="modal fade">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <div class="modal-header alert alert-info">
+          <h4 class="modal-title">Out of Sync Items</h4>
+        </div>
+        <div class="modal-body">
+          <table class="table table-striped table-condensed">
+          <tr ng-repeat="f in needed" ng-init="a = needAction(f)">
+            <td class="small-data"><span class="glyphicon glyphicon-{{needIcons[a]}}"></span> {{needActions[a]}}</td>
+            <td title="{{f.Name}}">{{f.Name | basename}}</td>
+            <td class="text-right small-data"><span ng-if="f.Size > 0">{{f.Size | binary}}B</span></td>
+          </tr>
+          </table>
+        </div>
+        <div class="modal-footer">
           <button type="button" class="btn btn-default" data-dismiss="modal"><span class="glyphicon glyphicon-remove"></span>&emsp;Close</button>
         </div>
       </div>

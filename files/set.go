@@ -1,3 +1,7 @@
+// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
+// Use of this source code is governed by an MIT-style license that can be
+// found in the LICENSE file.
+
 // Package files provides a set type to track local/remote files with newness checks.
 package files
 
@@ -116,7 +120,12 @@ func (m *Set) Need(id uint) []scanner.File {
 			continue
 		}
 
-		if gk.newerThan(rkID[gk.Name]) {
+		if rk, ok := rkID[gk.Name]; gk.newerThan(rk) {
+			if protocol.IsDeleted(gf.File.Flags) && (!ok || protocol.IsDeleted(m.files[rk].File.Flags)) {
+				// We don't need to delete files we don't have or that are already deleted
+				continue
+			}
+
 			fs = append(fs, gf.File)
 		}
 	}
@@ -293,6 +302,9 @@ func (m *Set) replace(cid uint, fs []scanner.File) {
 
 		if na != 0 {
 			// Someone had the file
+			f := m.files[nk]
+			f.Global = true
+			m.files[nk] = f
 			m.globalKey[n] = nk
 			m.globalAvailability[n] = na
 		} else {

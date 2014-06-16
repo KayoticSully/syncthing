@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file.
+
 iterations=${1:-5}
 
 id1=I6KAH7666SLLL5PFXSOAUFJCDZYAOMLEKCP2GB3BV5RQST3PSROA
@@ -17,12 +21,21 @@ start() {
 	done
 }
 
+clean() {
+	if [[ $(uname -s) == "Linux" ]] ; then
+		grep -v utf8-nfd
+	else
+		cat
+	fi
+}
+
+
 testConvergence() {
 	while true ; do
 		sleep 5
-		s1comp=$(curl -s "http://localhost:8082/rest/connections" | ./json "$id1/Completion")
-		s2comp=$(curl -s "http://localhost:8083/rest/connections" | ./json "$id2/Completion")
-		s3comp=$(curl -s "http://localhost:8081/rest/connections" | ./json "$id3/Completion")
+		s1comp=$(curl -HX-API-Key:abc123 -s "http://localhost:8082/rest/connections" | ./json "$id1/Completion")
+		s2comp=$(curl -HX-API-Key:abc123 -s "http://localhost:8083/rest/connections" | ./json "$id2/Completion")
+		s3comp=$(curl -HX-API-Key:abc123 -s "http://localhost:8081/rest/connections" | ./json "$id3/Completion")
 		s1comp=${s1comp:-0}
 		s2comp=${s2comp:-0}
 		s3comp=${s3comp:-0}
@@ -34,13 +47,13 @@ testConvergence() {
 	done
 
 	echo "Verifying..."
-	cat md5-? | sort | uniq > md5-tot
-	cat md5-12-? | sort | uniq > md5-12-tot
-	cat md5-23-? | sort | uniq > md5-23-tot
+	cat md5-? | sort | clean | uniq > md5-tot
+	cat md5-12-? | sort | clean | uniq > md5-12-tot
+	cat md5-23-? | sort | clean | uniq > md5-23-tot
 
 	for i in 1 2 3 12-1 12-2 23-2 23-3; do
 		pushd "s$i" >/dev/null
-		../md5r -l | sort > ../md5-$i
+		../md5r -l | sort | clean > ../md5-$i
 		popd >/dev/null
 	done
 
@@ -101,10 +114,11 @@ alterFiles() {
 	pkill -CONT syncthing
 }
 
+rm -f h?/*.idx.gz
+rm -rf s? s??-? s4d
+
 echo "Setting up files..."
 for i in 1 2 3 12-1 12-2 23-2 23-3; do
-	rm -f h$i/*.idx.gz
-	rm -rf "s$i"
 	mkdir "s$i"
 	pushd "s$i" >/dev/null
 	echo "  $i: random nonoverlapping"
@@ -113,8 +127,16 @@ for i in 1 2 3 12-1 12-2 23-2 23-3; do
 	touch "empty-$i"
 	echo "  $i: large file"
 	dd if=/dev/urandom of=large-$i bs=1024k count=55 2>/dev/null
+	echo "  $i: weird encodings"
+	echo somedata > "$(echo -e utf8-nfc-\\xc3\\xad)-$i"
+	echo somedata > "$(echo -e utf8-nfd-i\\xcc\\x81)-$i"
+	echo somedata > "$(echo -e cp850-\\xa1)-$i"
+	touch "empty-$i"
 	popd >/dev/null
 done
+
+mkdir s4d
+echo somerandomdata > s4d/extrafile
 
 echo "MD5-summing..."
 for i in 1 2 3 12-1 12-2 23-2 23-3 ; do
@@ -136,5 +158,5 @@ for ((t = 1; t <= $iterations; t++)) ; do
 done
 
 for i in 1 2 3 4 ; do
-	curl -X POST "http://localhost:808$i/rest/shutdown"
+	curl -HX-API-Key:abc123 -X POST "http://localhost:808$i/rest/shutdown"
 done

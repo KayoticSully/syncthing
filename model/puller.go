@@ -1,3 +1,7 @@
+// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
+// Use of this source code is governed by an MIT-style license that can be
+// found in the LICENSE file.
+
 package model
 
 import (
@@ -220,6 +224,10 @@ func (p *puller) fixupDirectories() {
 	var changed = 0
 
 	var walkFn = func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
 		if !info.IsDir() {
 			return nil
 		}

@@ -3,13 +3,14 @@
 export COPYFILE_DISABLE=true
 export GO386=387 # Don't use SSE on 32 bit builds
 
-distFiles=(README.md LICENSE) # apart from the binary itself
+distFiles=(README.md LICENSE CONTRIBUTORS) # apart from the binary itself
 version=$(git describe --always --dirty)
 date=$(git show -s --format=%ct)
 user=$(whoami)
 host=$(hostname)
 host=${host%%.*}
-ldflags="-w -X main.Version $version -X main.BuildStamp $date -X main.BuildUser $user -X main.BuildHost $host"
+bldenv=${ENVIRONMENT:-default}
+ldflags="-w -X main.Version $version -X main.BuildStamp $date -X main.BuildUser $user -X main.BuildHost $host -X main.BuildEnv $bldenv"
 
 check() {
 	if ! command -v godep >/dev/null ; then
@@ -29,6 +30,21 @@ build() {
 assets() {
 	check
 	godep go run cmd/assets/assets.go gui > auto/gui.files.go
+}
+
+test-cov() {
+	echo "mode: set" > coverage.out
+	fail=0
+
+	for dir in $(go list ./...) ; do
+		godep go test -coverprofile=profile.out $dir || fail=1
+		if [ -f profile.out ] ; then
+			grep -v "mode: set" profile.out >> coverage.out
+		rm profile.out
+        fi
+    done
+
+   exit $fail
 }
 
 test() {
@@ -60,7 +76,11 @@ zipDist() {
 	name="$1"
 	rm -rf "$name"
 	mkdir -p "$name"
-	cp syncthing.exe "${distFiles[@]}" "$name"
+	for f in "${distFiles[@]}" ; do
+		sed 's/$/
+/' < "$f" > "$name/$f.txt"
+	done
+	cp syncthing.exe "$name"
 	sign "$name/syncthing.exe"
 	zip -r "$name.zip" "$name"
 	rm -rf "$name"
@@ -97,6 +117,10 @@ case "$1" in
 		test
 		;;
 
+	test-cov)
+		test-cov
+		;;
+
 	tar)
 		rm -f *.tar.gz *.zip
 		test || exit 1
@@ -118,7 +142,7 @@ case "$1" in
 		godep go build ./cmd/stpidx
 		godep go build ./cmd/stcli
 
-		for os in darwin-amd64 linux-386 linux-amd64 freebsd-amd64 windows-amd64 windows-386 ; do
+		for os in darwin-amd64 linux-386 linux-amd64 freebsd-amd64 windows-amd64 windows-386 solaris-amd64 ; do
 			export GOOS=${os%-*}
 			export GOARCH=${os#*-}
 

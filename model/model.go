@@ -1,3 +1,7 @@
+// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
+// Use of this source code is governed by an MIT-style license that can be
+// found in the LICENSE file.
+
 package model
 
 import (
@@ -186,8 +190,8 @@ func (m *Model) ConnectionStats() map[string]ConnectionInfo {
 	res["total"] = ConnectionInfo{
 		Statistics: protocol.Statistics{
 			At:            time.Now(),
-			InBytesTotal:  int(in),
-			OutBytesTotal: int(out),
+			InBytesTotal:  in,
+			OutBytesTotal: out,
 		},
 	}
 
@@ -244,7 +248,11 @@ func (m *Model) NeedFilesRepo(repo string) []scanner.File {
 	m.rmut.RLock()
 	defer m.rmut.RUnlock()
 	if rf, ok := m.repoFiles[repo]; ok {
-		return rf.Need(cid.LocalID)
+		f := rf.Need(cid.LocalID)
+		if r := m.repoCfgs[repo].FileRanker(); r != nil {
+			files.SortBy(r).Sort(f)
+		}
+		return f
 	}
 	return nil
 }
@@ -254,6 +262,11 @@ func (m *Model) NeedFilesRepo(repo string) []scanner.File {
 func (m *Model) Index(nodeID string, repo string, fs []protocol.FileInfo) {
 	if debug {
 		l.Debugf("IDX(in): %s %q: %d files", nodeID, repo, len(fs))
+	}
+
+	if !m.repoSharedWith(repo, nodeID) {
+		l.Warnf("Unexpected repository ID %q sent from node %q; ensure that the repository exists and that this node is selected under \"Share With\" in the repository configuration.", repo, nodeID)
+		return
 	}
 
 	var files = make([]scanner.File, len(fs))
@@ -275,8 +288,7 @@ func (m *Model) Index(nodeID string, repo string, fs []protocol.FileInfo) {
 	if r, ok := m.repoFiles[repo]; ok {
 		r.Replace(id, files)
 	} else {
-		l.Warnf("Index from %s for unexpected repo %q; verify configuration", nodeID, repo)
-
+		l.Fatalf("Index for nonexistant repo %q", repo)
 	}
 	m.rmut.RUnlock()
 }
@@ -286,6 +298,11 @@ func (m *Model) Index(nodeID string, repo string, fs []protocol.FileInfo) {
 func (m *Model) IndexUpdate(nodeID string, repo string, fs []protocol.FileInfo) {
 	if debug {
 		l.Debugf("IDXUP(in): %s / %q: %d files", nodeID, repo, len(fs))
+	}
+
+	if !m.repoSharedWith(repo, nodeID) {
+		l.Warnf("Unexpected repository ID %q sent from node %q; ensure that the repository exists and that this node is selected under \"Share With\" in the repository configuration.", repo, nodeID)
+		return
 	}
 
 	var files = make([]scanner.File, len(fs))
@@ -307,9 +324,20 @@ func (m *Model) IndexUpdate(nodeID string, repo string, fs []protocol.FileInfo) 
 	if r, ok := m.repoFiles[repo]; ok {
 		r.Update(id, files)
 	} else {
-		l.Warnf("Index update from %s for nonexistant repo %q; dropping", nodeID, repo)
+		l.Fatalf("IndexUpdate for nonexistant repo %q", repo)
 	}
 	m.rmut.RUnlock()
+}
+
+func (m *Model) repoSharedWith(repo, nodeID string) bool {
+	m.rmut.RLock()
+	defer m.rmut.RUnlock()
+	for _, nrepo := range m.nodeRepos[nodeID] {
+		if nrepo == repo {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Model) ClusterConfig(nodeID string, config protocol.ClusterConfigMessage) {
@@ -567,7 +595,10 @@ func (m *Model) broadcastIndexLoop() {
 			idx := m.protocolIndex(repo)
 			indexWg.Add(1)
 			go func() {
-				m.saveIndex(repo, m.indexDir, idx)
+				err := m.saveIndex(repo, m.indexDir, idx)
+				if err != nil {
+					l.Infof("Saving index for %q: %v", repo, err)
+				}
 				indexWg.Done()
 			}()
 
@@ -688,7 +719,10 @@ func (m *Model) SaveIndexes(dir string) {
 	m.rmut.RLock()
 	for repo := range m.repoCfgs {
 		fs := m.protocolIndex(repo)
-		m.saveIndex(repo, dir, fs)
+		err := m.saveIndex(repo, dir, fs)
+		if err != nil {
+			l.Infof("Saving index for %q: %v", repo, err)
+		}
 	}
 	m.rmut.RUnlock()
 }
@@ -702,26 +736,44 @@ func (m *Model) LoadIndexes(dir string) {
 	m.rmut.RUnlock()
 }
 
-func (m *Model) saveIndex(repo string, dir string, fs []protocol.FileInfo) {
+func (m *Model) saveIndex(repo string, dir string, fs []protocol.FileInfo) error {
 	id := fmt.Sprintf("%x", sha1.Sum([]byte(m.repoCfgs[repo].Directory)))
 	name := id + ".idx.gz"
 	name = filepath.Join(dir, name)
-
-	idxf, err := os.Create(name + ".tmp")
+	tmp := fmt.Sprintf("%s.tmp.%d", name, time.Now().UnixNano())
+	idxf, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 	if err != nil {
-		return
+		return err
 	}
+	defer os.Remove(tmp)
 
 	gzw := gzip.NewWriter(idxf)
 
-	protocol.IndexMessage{
+	n, err := protocol.IndexMessage{
 		Repository: repo,
 		Files:      fs,
 	}.EncodeXDR(gzw)
-	gzw.Close()
-	idxf.Close()
+	if err != nil {
+		gzw.Close()
+		idxf.Close()
+		return err
+	}
 
-	osutil.Rename(name+".tmp", name)
+	err = gzw.Close()
+	if err != nil {
+		return err
+	}
+
+	err = idxf.Close()
+	if err != nil {
+		return err
+	}
+
+	if debug {
+		l.Debugln("wrote index,", n, "bytes uncompressed")
+	}
+
+	return osutil.Rename(tmp, name)
 }
 
 func (m *Model) loadIndex(repo string, dir string) []protocol.FileInfo {
@@ -798,4 +850,27 @@ func (m *Model) State(repo string) string {
 	default:
 		return "unknown"
 	}
+}
+
+func (m *Model) Override(repo string) {
+	fs := m.NeedFilesRepo(repo)
+
+	m.rmut.Lock()
+	r := m.repoFiles[repo]
+	for i := range fs {
+		f := &fs[i]
+		h := r.Get(cid.LocalID, f.Name)
+		if h.Name != f.Name {
+			// We are missing the file
+			f.Flags |= protocol.FlagDeleted
+			f.Blocks = nil
+		} else {
+			// We have the file, replace with our version
+			*f = h
+		}
+		f.Version = lamport.Default.Tick(f.Version)
+	}
+	m.rmut.Unlock()
+
+	r.Update(cid.LocalID, fs)
 }

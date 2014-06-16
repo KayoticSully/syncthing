@@ -1,3 +1,7 @@
+// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
+// Use of this source code is governed by an MIT-style license that can be
+// found in the LICENSE file.
+
 /*jslint browser: true, continue: true, plusplus: true */
 /*global $: false, angular: false */
 
@@ -5,6 +9,11 @@
 
 var syncthing = angular.module('syncthing', []);
 var urlbase = 'rest';
+
+syncthing.config(function ($httpProvider) {
+    $httpProvider.defaults.xsrfHeaderName = 'X-CSRF-Token';
+    $httpProvider.defaults.xsrfCookieName = 'CSRF-Token';
+});
 
 syncthing.controller('SyncthingCtrl', function ($scope, $http) {
     var prevDate = 0;
@@ -21,21 +30,37 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
     $scope.seenError = '';
     $scope.model = {};
     $scope.repos = {};
+    $scope.reportData = {};
+    $scope.reportPreview = false;
+
+    $scope.needActions = {
+        'rm': 'Del',
+        'rmdir': 'Del (dir)',
+        'sync': 'Sync',
+        'touch': 'Update',
+    }
+    $scope.needIcons = {
+        'rm': 'remove',
+        'rmdir': 'remove',
+        'sync': 'download',
+        'touch': 'asterisk',
+    }
 
     // Strings before bools look better
     $scope.settings = [
-    {id: 'ListenStr', descr: 'Sync Protocol Listen Addresses', type: 'text', restart: true},
-    {id: 'MaxSendKbps', descr: 'Outgoing Rate Limit (KiB/s)', type: 'number', restart: true},
-    {id: 'RescanIntervalS', descr: 'Rescan Interval (s)', type: 'number', restart: true},
-    {id: 'ReconnectIntervalS', descr: 'Reconnect Interval (s)', type: 'number', restart: true},
-    {id: 'ParallelRequests', descr: 'Max Outstanding Requests', type: 'number', restart: true},
-    {id: 'MaxChangeKbps', descr: 'Max File Change Rate (KiB/s)', type: 'number', restart: true},
+    {id: 'ListenStr', descr: 'Sync Protocol Listen Addresses', type: 'text'},
+    {id: 'MaxSendKbps', descr: 'Outgoing Rate Limit (KiB/s)', type: 'number'},
+    {id: 'RescanIntervalS', descr: 'Rescan Interval (s)', type: 'number'},
+    {id: 'ReconnectIntervalS', descr: 'Reconnect Interval (s)', type: 'number'},
+    {id: 'ParallelRequests', descr: 'Max Outstanding Requests', type: 'number'},
+    {id: 'MaxChangeKbps', descr: 'Max File Change Rate (KiB/s)', type: 'number'},
 
-    {id: 'GlobalAnnEnabled', descr: 'Global Discovery', type: 'bool', restart: true},
-    {id: 'LocalAnnEnabled', descr: 'Local Discovery', type: 'bool', restart: true},
-    {id: 'LocalAnnPort', descr: 'Local Discovery Port', type: 'number', restart: true},
+    {id: 'LocalAnnPort', descr: 'Local Discovery Port', type: 'number'},
+    {id: 'LocalAnnEnabled', descr: 'Local Discovery', type: 'bool'},
+    {id: 'GlobalAnnEnabled', descr: 'Global Discovery', type: 'bool'},
     {id: 'StartBrowser', descr: 'Start Browser', type: 'bool'},
     {id: 'UPnPEnabled', descr: 'Enable UPnP', type: 'bool'},
+    {id: 'UREnabled', descr: 'Anonymous Usage Reporting', type: 'bool'},
     ];
 
     $scope.guiSettings = [
@@ -43,6 +68,7 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
     {id: 'User', descr: 'GUI Authentication User', type: 'text', restart: true},
     {id: 'Password', descr: 'GUI Authentication Password', type: 'password', restart: true},
     {id: 'UseTLS', descr: 'Use HTTPS for GUI', type: 'bool', restart: true},
+    {id: 'APIKey', descr: 'API Key', type: 'apikey'},
     ];
 
     function getSucceeded() {
@@ -258,6 +284,16 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
         $('#settings').modal({backdrop: 'static', keyboard: true});
     };
 
+    $scope.saveConfig = function() {
+        var cfg = JSON.stringify($scope.config);
+        var opts = {headers: {'Content-Type': 'application/json'}};
+        $http.post(urlbase + '/config', cfg, opts).success(function () {
+            $http.get(urlbase + '/config/sync').success(function (data) {
+                $scope.configInSync = data.configInSync;
+            });
+        });
+    };
+
     $scope.saveSettings = function () {
         // Make sure something changed
         var changed = ! angular.equals($scope.config.Options, $scope.config.workingOptions) ||
@@ -271,10 +307,9 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
             // Apply new settings locally
             $scope.config.Options = angular.copy($scope.config.workingOptions);
             $scope.config.GUI = angular.copy($scope.config.workingGUI);
-
-            $scope.configInSync = false;
             $scope.config.Options.ListenAddress = $scope.config.Options.ListenStr.split(',').map(function (x) { return x.trim(); });
-            $http.post(urlbase + '/config', JSON.stringify($scope.config), {headers: {'Content-Type': 'application/json'}});
+
+            $scope.saveConfig();
         }
 
         $('#settings').modal("hide");
@@ -348,14 +383,12 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
             });
         }
 
-        $scope.configInSync = false;
-        $http.post(urlbase + '/config', JSON.stringify($scope.config), {headers: {'Content-Type': 'application/json'}});
+        $scope.saveConfig();
     };
 
     $scope.saveNode = function () {
         var nodeCfg, done, i;
 
-        $scope.configInSync = false;
         $('#editNode').modal('hide');
         nodeCfg = $scope.currentNode;
         nodeCfg.NodeID = nodeCfg.NodeID.replace(/ /g, '').replace(/-/g, '').toUpperCase().trim();
@@ -377,7 +410,7 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
         $scope.nodes.sort(nodeCompare);
         $scope.config.Nodes = $scope.nodes;
 
-        $http.post(urlbase + '/config', JSON.stringify($scope.config), {headers: {'Content-Type': 'application/json'}});
+        $scope.saveConfig();
     };
 
     $scope.otherNodes = function () {
@@ -452,7 +485,6 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
     $scope.saveRepo = function () {
         var repoCfg, done, i;
 
-        $scope.configInSync = false;
         $('#editRepo').modal('hide');
         repoCfg = $scope.currentRepo;
         repoCfg.Nodes = [];
@@ -480,7 +512,7 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
         $scope.repos[repoCfg.ID] = repoCfg;
         $scope.config.Repositories = repoList($scope.repos);
 
-        $http.post(urlbase + '/config', JSON.stringify($scope.config), {headers: {'Content-Type': 'application/json'}});
+        $scope.saveConfig();
     };
 
     $scope.sharesRepo = function(repoCfg) {
@@ -501,8 +533,11 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
         delete $scope.repos[$scope.currentRepo.ID];
         $scope.config.Repositories = repoList($scope.repos);
 
-        $scope.configInSync = false;
-        $http.post(urlbase + '/config', JSON.stringify($scope.config), {headers: {'Content-Type': 'application/json'}});
+        $scope.saveConfig();
+    };
+
+    $scope.setAPIKey = function (cfg) {
+        cfg.APIKey = randomString(30, 32);
     };
 
     $scope.init = function() {
@@ -525,10 +560,76 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
             $scope.repos = repoMap($scope.config.Repositories);
 
             $scope.refresh();
+
+            if (!$scope.config.Options.UREnabled && !$scope.config.Options.URDeclined) {
+                // If usage reporting has been neither accepted nor declined,
+                // we want to ask the user to make a choice. But we don't want
+                // to bug them during initial setup, so we set a cookie with
+                // the time of the first visit. When that cookie is present
+                // and the time is more than four hours ago, we ask the
+                // question.
+
+                var firstVisit = document.cookie.replace(/(?:(?:^|.*;\s*)firstVisit\s*\=\s*([^;]*).*$)|^.*$/, "$1");
+                if (!firstVisit) {
+                    document.cookie = "firstVisit=" + Date.now() + ";max-age=" + 30*24*3600;
+                } else {
+                    if (+firstVisit < Date.now() - 4*3600*1000){
+                        $('#ur').modal({backdrop: 'static', keyboard: false});
+                    }
+                }
+            }
         });
 
         $http.get(urlbase + '/config/sync').success(function (data) {
             $scope.configInSync = data.configInSync;
+        });
+
+        $http.get(urlbase + '/report').success(function (data) {
+            $scope.reportData = data;
+        });
+    };
+
+    $scope.acceptUR = function () {
+        $scope.config.Options.UREnabled = true;
+        $scope.config.Options.URDeclined = false;
+        $scope.saveConfig();
+        $('#ur').modal('hide');
+    };
+
+    $scope.declineUR = function () {
+        $scope.config.Options.UREnabled = false;
+        $scope.config.Options.URDeclined = true;
+        $scope.saveConfig();
+        $('#ur').modal('hide');
+    };
+
+    $scope.showNeed = function (repo) {
+        $scope.neededLoaded = false;
+        $('#needed').modal({backdrop: 'static', keyboard: true});
+        $http.get(urlbase + "/need?repo=" + encodeURIComponent(repo)).success(function (data) {
+            $scope.needed = data;
+            $scope.neededLoaded = true;
+        });
+    };
+
+    $scope.needAction = function (file) {
+        var fDelete = 4096;
+        var fDirectory = 16384;
+
+        if ((file.Flags & (fDelete+fDirectory)) === fDelete+fDirectory) {
+            return 'rmdir';
+        } else if ((file.Flags & fDelete) === fDelete) {
+            return 'rm';
+        } else if ((file.Flags & fDirectory) === fDirectory) {
+            return 'touch';
+        } else {
+            return 'sync';
+        }
+    };
+
+    $scope.override = function (repo) {
+        $http.post(urlbase + "/model/override?repo=" + encodeURIComponent(repo)).success(function () {
+            $scope.refresh();
         });
     };
 
@@ -582,6 +683,18 @@ function decimals(val, num) {
     digits = Math.floor(Math.log(Math.abs(val)) / Math.log(10));
     decs = Math.max(0, num - digits);
     return decs;
+}
+
+function randomString(len, bits)
+{
+    bits = bits || 36;
+    var outStr = "", newStr;
+    while (outStr.length < len)
+    {
+        newStr = Math.random().toString(bits).slice(2);
+        outStr += newStr.slice(0, Math.min(newStr.length, (len - outStr.length)));
+    }
+    return outStr.toUpperCase();
 }
 
 syncthing.filter('natural', function () {
@@ -667,6 +780,18 @@ syncthing.filter('shortPath', function () {
             return input;
         }
         return ".../" + parts.slice(parts.length-2).join("/");
+    };
+});
+
+syncthing.filter('basename', function () {
+    return function (input) {
+        if (input === undefined)
+            return "";
+        var parts = input.split(/[\/\\]/);
+        if (!parts || parts.length < 1) {
+            return input;
+        }
+        return parts[parts.length-1];
     };
 });
 

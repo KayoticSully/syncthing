@@ -1,3 +1,7 @@
+// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
+// Use of this source code is governed by an MIT-style license that can be
+// found in the LICENSE file.
+
 // Package config implements reading and writing of the syncthing configuration file.
 package config
 
@@ -7,10 +11,12 @@ import (
 	"io"
 	"os"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/calmh/syncthing/scanner"
 	"code.google.com/p/go.crypto/bcrypt"
 	"github.com/calmh/syncthing/logger"
 )
@@ -26,14 +32,42 @@ type Configuration struct {
 	XMLName      xml.Name                  `xml:"configuration" json:"-"`
 }
 
+// SyncOrderPattern allows a user to prioritize file downloading based on a
+// regular expression.  If a file matches the Pattern the Priority will be
+// assigned to the file.  If a file matches more than one Pattern the
+// Priorities are summed.  This allows a user to, for example, prioritize files
+// in a directory, as well as prioritize based on file type.  The higher the
+// priority the "sooner" a file will be downloaded.  Files can be deprioritized
+// by giving them a negative priority.  While Priority is represented as an
+// integer, the expected range is something like -1000 to 1000.
+type SyncOrderPattern struct {
+	Pattern         string `xml:"pattern,attr"`
+	Priority        int    `xml:"priority,attr"`
+	compiledPattern *regexp.Regexp
+}
+
+func (s *SyncOrderPattern) CompiledPattern() *regexp.Regexp {
+	if s.compiledPattern == nil {
+		re, err := regexp.Compile(s.Pattern)
+		if err != nil {
+			l.Warnln("Could not compile regexp (" + s.Pattern + "): " + err.Error())
+			s.compiledPattern = regexp.MustCompile("^\\0$")
+		} else {
+			s.compiledPattern = re
+		}
+	}
+	return s.compiledPattern
+}
+
 type RepositoryConfiguration struct {
-	ID          string                  `xml:"id,attr"`
-	Directory   string                  `xml:"directory,attr"`
-	Nodes       []NodeConfiguration     `xml:"node"`
-	ReadOnly    bool                    `xml:"ro,attr"`
-	IgnorePerms bool                    `xml:"ignorePerms,attr"`
-	Invalid     string                  `xml:"-"` // Set at runtime when there is an error, not saved
-	Versioning  VersioningConfiguration `xml:"versioning"`
+	ID                string                  `xml:"id,attr"`
+	Directory         string                  `xml:"directory,attr"`
+	Nodes             []NodeConfiguration     `xml:"node"`
+	ReadOnly          bool                    `xml:"ro,attr"`
+	IgnorePerms       bool                    `xml:"ignorePerms,attr"`
+	Invalid           string                  `xml:"-"` // Set at runtime when there is an error, not saved
+	Versioning        VersioningConfiguration `xml:"versioning"`
+	SyncOrderPatterns []SyncOrderPattern      `xml:"syncorder>pattern"`
 
 	nodeIDs []string
 }
@@ -88,6 +122,21 @@ func (r *RepositoryConfiguration) NodeIDs() []string {
 	return r.nodeIDs
 }
 
+func (r RepositoryConfiguration) FileRanker() func(scanner.File) int {
+	if len(r.SyncOrderPatterns) <= 0 {
+		return nil
+	}
+	return func(f scanner.File) int {
+		ret := 0
+		for _, v := range r.SyncOrderPatterns {
+			if v.CompiledPattern().MatchString(f.Name) {
+				ret += v.Priority
+			}
+		}
+		return ret
+	}
+}
+
 type NodeConfiguration struct {
 	NodeID    string   `xml:"id,attr"`
 	Name      string   `xml:"name,attr,omitempty"`
@@ -108,6 +157,10 @@ type OptionsConfiguration struct {
 	StartBrowser       bool     `xml:"startBrowser" default:"true"`
 	UPnPEnabled        bool     `xml:"upnpEnabled" default:"true"`
 
+	UREnabled  bool `xml:"urEnabled"`  // If true, send usage reporting data
+	URDeclined bool `xml:"urDeclined"` // If true, don't ask again
+	URAccepted int  `xml:"urAccepted"` // Accepted usage reporting version
+
 	Deprecated_ReadOnly   bool   `xml:"readOnly,omitempty" json:"-"`
 	Deprecated_GUIEnabled bool   `xml:"guiEnabled,omitempty" json:"-"`
 	Deprecated_GUIAddress string `xml:"guiAddress,omitempty" json:"-"`
@@ -119,6 +172,23 @@ type GUIConfiguration struct {
 	User     string `xml:"user,omitempty"`
 	Password string `xml:"password,omitempty"`
 	UseTLS   bool   `xml:"tls,attr"`
+	APIKey   string `xml:"apikey,omitempty"`
+}
+
+func (cfg *Configuration) NodeMap() map[string]NodeConfiguration {
+	m := make(map[string]NodeConfiguration, len(cfg.Nodes))
+	for _, n := range cfg.Nodes {
+		m[n.NodeID] = n
+	}
+	return m
+}
+
+func (cfg *Configuration) RepoMap() map[string]RepositoryConfiguration {
+	m := make(map[string]RepositoryConfiguration, len(cfg.Repositories))
+	for _, r := range cfg.Repositories {
+		m[r.ID] = r
+	}
+	return m
 }
 
 func setDefaults(data interface{}) error {

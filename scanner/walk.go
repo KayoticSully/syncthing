@@ -1,3 +1,7 @@
+// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
+// Use of this source code is governed by an MIT-style license that can be
+// found in the LICENSE file.
+
 package scanner
 
 import (
@@ -9,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"code.google.com/p/go.text/unicode/norm"
 
 	"github.com/calmh/syncthing/lamport"
 	"github.com/calmh/syncthing/protocol"
@@ -152,6 +157,11 @@ func (w *Walker) walkAndHashFiles(res *[]File, ign map[string][]string) filepath
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+
+		if (runtime.GOOS == "linux" || runtime.GOOS == "windows") && !norm.NFC.IsNormalString(rn) {
+			l.Warnf("File %q contains non-NFC UTF-8 sequences and cannot be synced. Consider renaming.", rn)
 			return nil
 		}
 

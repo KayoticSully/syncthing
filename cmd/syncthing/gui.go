@@ -1,3 +1,7 @@
+// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
+// Use of this source code is governed by an MIT-style license that can be
+// found in the LICENSE file.
+
 package main
 
 import (
@@ -12,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sync"
 	"time"
@@ -36,6 +41,7 @@ var (
 	guiErrors    = []guiError{}
 	guiErrorsMut sync.Mutex
 	static       func(http.ResponseWriter, *http.Request, *log.Logger)
+	apiKey       string
 )
 
 const (
@@ -52,6 +58,8 @@ func startGUI(cfg config.GUIConfiguration, assetDir string, m *model.Model) erro
 	if cfg.UseTLS {
 		cert, err := loadCert(confDir, "https-")
 		if err != nil {
+			l.Infoln("Loading HTTPS certificate:", err)
+			l.Infoln("Creating new HTTPS certificate")
 			newCertificate(confDir, "https-")
 			cert, err = loadCert(confDir, "https-")
 		}
@@ -90,6 +98,7 @@ func startGUI(cfg config.GUIConfiguration, assetDir string, m *model.Model) erro
 	router.Get("/rest/system", restGetSystem)
 	router.Get("/rest/errors", restGetErrors)
 	router.Get("/rest/discovery", restGetDiscovery)
+	router.Get("/rest/report", restGetReport)
 	router.Get("/qr/:text", getQR)
 
 	router.Post("/rest/config", restPostConfig)
@@ -99,8 +108,10 @@ func startGUI(cfg config.GUIConfiguration, assetDir string, m *model.Model) erro
 	router.Post("/rest/error", restPostError)
 	router.Post("/rest/error/clear", restClearErrors)
 	router.Post("/rest/discovery/hint", restPostDiscoveryHint)
+	router.Post("/rest/model/override", restPostOverride)
 
 	mr := martini.New()
+	mr.Use(csrfMiddleware)
 	if len(cfg.User) > 0 && len(cfg.Password) > 0 {
 		mr.Use(basic(cfg.User, cfg.Password))
 	}
@@ -109,6 +120,9 @@ func startGUI(cfg config.GUIConfiguration, assetDir string, m *model.Model) erro
 	mr.Use(restMiddleware)
 	mr.Action(router.Handle)
 	mr.Map(m)
+
+	apiKey = cfg.APIKey
+	loadCsrfTokens()
 
 	go http.Serve(listener, mr)
 
@@ -159,6 +173,12 @@ func restGetModel(m *model.Model, w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(res)
 }
 
+func restPostOverride(m *model.Model, r *http.Request) {
+	var qs = r.URL.Query()
+	var repo = qs.Get("repo")
+	m.Override(repo)
+}
+
 func restGetNeed(m *model.Model, w http.ResponseWriter, r *http.Request) {
 	var qs = r.URL.Query()
 	var repo = qs.Get("repo")
@@ -183,7 +203,7 @@ func restGetConfig(w http.ResponseWriter) {
 	json.NewEncoder(w).Encode(encCfg)
 }
 
-func restPostConfig(req *http.Request) {
+func restPostConfig(req *http.Request, m *model.Model) {
 	var newCfg config.Configuration
 	err := json.NewDecoder(req.Body).Decode(&newCfg)
 	if err != nil {
@@ -201,9 +221,69 @@ func restPostConfig(req *http.Request) {
 				newCfg.GUI.Password = string(hash)
 			}
 		}
+
+		// Figure out if any changes require a restart
+
+		if len(cfg.Repositories) != len(newCfg.Repositories) {
+			configInSync = false
+		} else {
+			om := cfg.RepoMap()
+			nm := newCfg.RepoMap()
+			for id := range om {
+				if !reflect.DeepEqual(om[id], nm[id]) {
+					configInSync = false
+					break
+				}
+			}
+		}
+
+		if len(cfg.Nodes) != len(newCfg.Nodes) {
+			configInSync = false
+		} else {
+			om := cfg.NodeMap()
+			nm := newCfg.NodeMap()
+			for k := range om {
+				if _, ok := nm[k]; !ok {
+					configInSync = false
+					break
+				}
+			}
+		}
+
+		if newCfg.Options.UREnabled && !cfg.Options.UREnabled {
+			// UR was enabled
+			cfg.Options.UREnabled = true
+			cfg.Options.URDeclined = false
+			cfg.Options.URAccepted = usageReportVersion
+			// Set the corresponding options in newCfg so we don't trigger the restart check if this was the only option change
+			newCfg.Options.URDeclined = false
+			newCfg.Options.URAccepted = usageReportVersion
+			err := sendUsageReport(m)
+			if err != nil {
+				l.Infoln("Usage report:", err)
+			}
+			go usageReportingLoop(m)
+		} else if !newCfg.Options.UREnabled && cfg.Options.UREnabled {
+			// UR was disabled
+			cfg.Options.UREnabled = false
+			cfg.Options.URDeclined = true
+			cfg.Options.URAccepted = 0
+			// Set the corresponding options in newCfg so we don't trigger the restart check if this was the only option change
+			newCfg.Options.URDeclined = true
+			newCfg.Options.URAccepted = 0
+			stopUsageReporting()
+		} else {
+			cfg.Options.URDeclined = newCfg.Options.URDeclined
+		}
+
+		if !reflect.DeepEqual(cfg.Options, newCfg.Options) || !reflect.DeepEqual(cfg.GUI, newCfg.GUI) {
+			configInSync = false
+		}
+
+		// Activate and save
+
 		cfg = newCfg
 		saveConfig()
-		configInSync = false
 	}
 }
 
@@ -301,6 +381,10 @@ func restGetDiscovery(w http.ResponseWriter) {
 	json.NewEncoder(w).Encode(discoverer.All())
 }
 
+func restGetReport(w http.ResponseWriter, m *model.Model) {
+	json.NewEncoder(w).Encode(reportData(m))
+}
+
 func getQR(w http.ResponseWriter, params martini.Params) {
 	code, err := qr.Encode(params["text"], qr.M)
 	if err != nil {
@@ -314,6 +398,10 @@ func getQR(w http.ResponseWriter, params martini.Params) {
 
 func basic(username string, passhash string) http.HandlerFunc {
 	return func(res http.ResponseWriter, req *http.Request) {
+		if validAPIKey(req.Header.Get("X-API-Key")) {
+			return
+		}
+
 		error := func() {
 			time.Sleep(time.Duration(rand.Intn(100)+100) * time.Millisecond)
 			res.Header().Set("WWW-Authenticate", "Basic realm=\"Authorization Required\"")
@@ -349,6 +437,10 @@ func basic(username string, passhash string) http.HandlerFunc {
 			return
 		}
 	}
+}
+
+func validAPIKey(k string) bool {
+	return len(apiKey) > 0 && k == apiKey
 }
 
 func embeddedStatic() func(http.ResponseWriter, *http.Request, *log.Logger) {

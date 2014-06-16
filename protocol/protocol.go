@@ -1,3 +1,7 @@
+// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
+// Use of this source code is governed by an MIT-style license that can be
+// found in the LICENSE file.
+
 package protocol
 
 import (
@@ -77,7 +81,7 @@ type rawConnection struct {
 	xw   *xdr.Writer
 	wmut sync.Mutex
 
-	indexSent map[string]map[string][2]int64
+	indexSent map[string]map[string]uint64
 	awaiting  []chan asyncResult
 	imut      sync.Mutex
 
@@ -92,8 +96,8 @@ type asyncResult struct {
 }
 
 const (
-	pingTimeout  = 300 * time.Second
-	pingIdleTime = 600 * time.Second
+	pingTimeout  = 30 * time.Second
+	pingIdleTime = 60 * time.Second
 )
 
 func NewConnection(nodeID string, reader io.Reader, writer io.Writer, receiver Model) Connection {
@@ -118,12 +122,13 @@ func NewConnection(nodeID string, reader io.Reader, writer io.Writer, receiver M
 		wb:        wb,
 		xw:        xdr.NewWriter(wb),
 		awaiting:  make([]chan asyncResult, 0x1000),
-		indexSent: make(map[string]map[string][2]int64),
+		indexSent: make(map[string]map[string]uint64),
 		outbox:    make(chan []encodable),
 		nextID:    make(chan int),
 		closed:    make(chan struct{}),
 	}
 
+	go c.indexSerializerLoop()
 	go c.readerLoop()
 	go c.writerLoop()
 	go c.pingerLoop()
@@ -144,25 +149,27 @@ func (c *rawConnection) Index(repo string, idx []FileInfo) {
 		// This is the first time we send an index.
 		msgType = messageTypeIndex
 
-		c.indexSent[repo] = make(map[string][2]int64)
+		c.indexSent[repo] = make(map[string]uint64)
 		for _, f := range idx {
-			c.indexSent[repo][f.Name] = [2]int64{f.Modified, int64(f.Version)}
+			c.indexSent[repo][f.Name] = f.Version
 		}
 	} else {
 		// We have sent one full index. Only send updates now.
 		msgType = messageTypeIndexUpdate
 		var diff []FileInfo
 		for _, f := range idx {
-			if vs, ok := c.indexSent[repo][f.Name]; !ok || f.Modified != vs[0] || int64(f.Version) != vs[1] {
+			if vs, ok := c.indexSent[repo][f.Name]; !ok || f.Version != vs {
 				diff = append(diff, f)
-				c.indexSent[repo][f.Name] = [2]int64{f.Modified, int64(f.Version)}
+				c.indexSent[repo][f.Name] = f.Version
 			}
 		}
 		idx = diff
 	}
-	c.imut.Unlock()
 
-	c.send(header{0, -1, msgType}, IndexMessage{repo, idx})
+	if len(idx) > 0 {
+		c.send(header{0, -1, msgType}, IndexMessage{repo, idx})
+	}
+	c.imut.Unlock()
 }
 
 // Request returns the bytes for the specified block after fetching them from the connected peer.
@@ -281,6 +288,31 @@ func (c *rawConnection) readerLoop() (err error) {
 	}
 }
 
+type incomingIndex struct {
+	update bool
+	id     string
+	repo   string
+	files  []FileInfo
+}
+
+var incomingIndexes = make(chan incomingIndex, 100) // should be enough for anyone, right?
+
+func (c *rawConnection) indexSerializerLoop() {
+	// We must avoid blocking the reader loop when processing large indexes.
+	// There is otherwise a potential deadlock where both sides has the model
+	// locked because it's sending a large index update and can't receive the
+	// large index update from the other side. But we must also ensure to
+	// process the indexes in the order they are received, hence the separate
+	// routine and buffered channel.
+	for ii := range incomingIndexes {
+		if ii.update {
+			c.receiver.IndexUpdate(ii.id, ii.repo, ii.files)
+		} else {
+			c.receiver.Index(ii.id, ii.repo, ii.files)
+		}
+	}
+}
+
 func (c *rawConnection) handleIndex() error {
 	var im IndexMessage
 	im.decodeXDR(c.xr)
@@ -295,7 +327,7 @@ func (c *rawConnection) handleIndex() error {
 		// update and can't receive the large index update from the
 		// other side.
 
-		go c.receiver.Index(c.id, im.Repository, im.Files)
+		incomingIndexes <- incomingIndex{false, c.id, im.Repository, im.Files}
 	}
 	return nil
 }
@@ -306,7 +338,7 @@ func (c *rawConnection) handleIndexUpdate() error {
 	if err := c.xr.Error(); err != nil {
 		return err
 	} else {
-		go c.receiver.IndexUpdate(c.id, im.Repository, im.Files)
+		incomingIndexes <- incomingIndex{true, c.id, im.Repository, im.Files}
 	}
 	return nil
 }
@@ -496,7 +528,9 @@ func (c *rawConnection) pingerLoop() {
 			}()
 			select {
 			case ok := <-rc:
-				l.Debugln(c.id, "<- pong")
+				if debug {
+					l.Debugln(c.id, "<- pong")
+				}
 				if !ok {
 					c.close(fmt.Errorf("ping failure"))
 				}
@@ -521,15 +555,15 @@ func (c *rawConnection) processRequest(msgID int, req RequestMessage) {
 
 type Statistics struct {
 	At            time.Time
-	InBytesTotal  int
-	OutBytesTotal int
+	InBytesTotal  uint64
+	OutBytesTotal uint64
 }
 
 func (c *rawConnection) Statistics() Statistics {
 	return Statistics{
 		At:            time.Now(),
-		InBytesTotal:  int(c.cr.Tot()),
-		OutBytesTotal: int(c.cw.Tot()),
+		InBytesTotal:  c.cr.Tot(),
+		OutBytesTotal: c.cw.Tot(),
 	}
 }
 
