@@ -1,6 +1,6 @@
-// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
-// Use of this source code is governed by an MIT-style license that can be
-// found in the LICENSE file.
+// Copyright (C) 2014 Jakob Borg and Contributors (see the CONTRIBUTORS file).
+// All rights reserved. Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
 
 // Adapted from https://github.com/jackpal/Taipei-Torrent/blob/dd88a8bfac6431c01d959ce3c745e74b8a911793/IGD.go
 // Copyright (c) 2010 Jack Palevich (https://github.com/jackpal/Taipei-Torrent/blob/dd88a8bfac6431c01d959ce3c745e74b8a911793/LICENSE)
@@ -203,12 +203,24 @@ func getServiceURL(rootURL string) (string, error) {
 	}
 
 	u, _ := url.Parse(rootURL)
-	if svc.ControlURL[0] == '/' {
-		u.Path = svc.ControlURL
-	} else {
-		u.Path += svc.ControlURL
-	}
+	replaceRawPath(u, svc.ControlURL)
 	return u.String(), nil
+}
+
+func replaceRawPath(u *url.URL, rp string) {
+	var p, q string
+	fs := strings.Split(rp, "?")
+	p = fs[0]
+	if len(fs) > 1 {
+		q = fs[1]
+	}
+
+	if p[0] == '/' {
+		u.Path = p
+	} else {
+		u.Path += p
+	}
+	u.RawQuery = q
 }
 
 func soapRequest(url, function, message string) error {

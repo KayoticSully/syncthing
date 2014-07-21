@@ -1,6 +1,6 @@
-// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
-// Use of this source code is governed by an MIT-style license that can be
-// found in the LICENSE file.
+// Copyright (C) 2014 Jakob Borg and Contributors (see the CONTRIBUTORS file).
+// All rights reserved. Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
 
 package main
 
@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/calmh/syncthing/discover"
+	"github.com/calmh/syncthing/protocol"
 	"github.com/golang/groupcache/lru"
 	"github.com/juju/ratelimit"
 )
@@ -32,15 +33,18 @@ type address struct {
 }
 
 var (
-	nodes     = make(map[string]node)
-	lock      sync.Mutex
-	queries   = 0
-	announces = 0
-	answered  = 0
-	limited   = 0
-	unknowns  = 0
-	debug     = false
-	limiter   = lru.New(1024)
+	nodes      = make(map[protocol.NodeID]node)
+	lock       sync.Mutex
+	queries    = 0
+	announces  = 0
+	answered   = 0
+	limited    = 0
+	unknowns   = 0
+	debug      = false
+	lruSize    = 1024
+	limitAvg   = 1
+	limitBurst = 10
+	limiter    *lru.Cache
 )
 
 func main() {
@@ -49,12 +53,17 @@ func main() {
 	var statsIntv int
 	var statsFile string
 
-	flag.StringVar(&listen, "listen", ":22025", "Listen address")
+	flag.StringVar(&listen, "listen", ":22026", "Listen address")
 	flag.BoolVar(&debug, "debug", false, "Enable debug output")
 	flag.BoolVar(&timestamp, "timestamp", true, "Timestamp the log output")
 	flag.IntVar(&statsIntv, "stats-intv", 0, "Statistics output interval (s)")
 	flag.StringVar(&statsFile, "stats-file", "/var/log/discosrv.stats", "Statistics file name")
+	flag.IntVar(&lruSize, "limit-cache", lruSize, "Limiter cache entries")
+	flag.IntVar(&limitAvg, "limit-avg", limitAvg, "Allowed average package rate, per 10 s")
+	flag.IntVar(&limitBurst, "limit-burst", limitBurst, "Allowed burst size, packets")
 	flag.Parse()
+
+	limiter = lru.New(lruSize)
 
 	log.SetOutput(os.Stdout)
 	if !timestamp {
@@ -94,10 +103,10 @@ func main() {
 		magic := binary.BigEndian.Uint32(buf)
 
 		switch magic {
-		case discover.AnnouncementMagicV2:
+		case discover.AnnouncementMagic:
 			handleAnnounceV2(addr, buf)
 
-		case discover.QueryMagicV2:
+		case discover.QueryMagic:
 			handleQueryV2(conn, addr, buf)
 
 		default:
@@ -130,14 +139,14 @@ func limit(addr *net.UDPAddr) bool {
 			log.Println("New limiter for", key)
 		}
 		// One packet per ten seconds average rate, burst ten packets
-		limiter.Add(key, ratelimit.NewBucket(10*time.Second, 10))
+		limiter.Add(key, ratelimit.NewBucket(10*time.Second/time.Duration(limitAvg), int64(limitBurst)))
 	}
 
 	return false
 }
 
 func handleAnnounceV2(addr *net.UDPAddr, buf []byte) {
-	var pkt discover.AnnounceV2
+	var pkt discover.Announce
 	err := pkt.UnmarshalXDR(buf)
 	if err != nil && err != io.EOF {
 		log.Println("AnnounceV2 Unmarshal:", err)
@@ -174,13 +183,21 @@ func handleAnnounceV2(addr *net.UDPAddr, buf []byte) {
 		updated:   time.Now(),
 	}
 
+	var id protocol.NodeID
+	if len(pkt.This.ID) == 32 {
+		// Raw node ID
+		copy(id[:], pkt.This.ID)
+	} else {
+		id.UnmarshalText(pkt.This.ID)
+	}
+
 	lock.Lock()
-	nodes[pkt.This.ID] = node
+	nodes[id] = node
 	lock.Unlock()
 }
 
 func handleQueryV2(conn *net.UDPConn, addr *net.UDPAddr, buf []byte) {
-	var pkt discover.QueryV2
+	var pkt discover.Query
 	err := pkt.UnmarshalXDR(buf)
 	if err != nil {
 		log.Println("QueryV2 Unmarshal:", err)
@@ -191,14 +208,22 @@ func handleQueryV2(conn *net.UDPConn, addr *net.UDPAddr, buf []byte) {
 		log.Printf("<- %v %#v", addr, pkt)
 	}
 
+	var id protocol.NodeID
+	if len(pkt.NodeID) == 32 {
+		// Raw node ID
+		copy(id[:], pkt.NodeID)
+	} else {
+		id.UnmarshalText(pkt.NodeID)
+	}
+
 	lock.Lock()
-	node, ok := nodes[pkt.NodeID]
+	node, ok := nodes[id]
 	queries++
 	lock.Unlock()
 
 	if ok && len(node.addresses) > 0 {
-		ann := discover.AnnounceV2{
-			Magic: discover.AnnouncementMagicV2,
+		ann := discover.Announce{
+			Magic: discover.AnnouncementMagic,
 			This: discover.Node{
 				ID: pkt.NodeID,
 			},

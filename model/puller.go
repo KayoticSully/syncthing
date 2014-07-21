@@ -1,6 +1,6 @@
-// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
-// Use of this source code is governed by an MIT-style license that can be
-// found in the LICENSE file.
+// Copyright (C) 2014 Jakob Borg and Contributors (see the CONTRIBUTORS file).
+// All rights reserved. Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
 
 package model
 
@@ -9,12 +9,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"time"
 
-	"github.com/calmh/syncthing/buffers"
-	"github.com/calmh/syncthing/cid"
 	"github.com/calmh/syncthing/config"
+	"github.com/calmh/syncthing/events"
 	"github.com/calmh/syncthing/osutil"
 	"github.com/calmh/syncthing/protocol"
 	"github.com/calmh/syncthing/scanner"
@@ -22,8 +20,8 @@ import (
 )
 
 type requestResult struct {
-	node     string
-	file     scanner.File
+	node     protocol.NodeID
+	file     protocol.FileInfo
 	filepath string // full filepath name
 	offset   int64
 	data     []byte
@@ -33,36 +31,30 @@ type requestResult struct {
 type openFile struct {
 	filepath     string // full filepath name
 	temp         string // temporary filename
-	availability uint64 // availability bitset
+	availability []protocol.NodeID
 	file         *os.File
 	err          error // error when opening or writing to file, all following operations are cancelled
 	outstanding  int   // number of requests we still have outstanding
 	done         bool  // we have sent all requests for this file
 }
 
-type activityMap map[string]int
+type activityMap map[protocol.NodeID]int
 
-func (m activityMap) leastBusyNode(availability uint64, cm *cid.Map) string {
+func (m activityMap) leastBusyNode(availability []protocol.NodeID, isValid func(protocol.NodeID) bool) protocol.NodeID {
 	var low int = 2<<30 - 1
-	var selected string
-	for _, node := range cm.Names() {
-		id := cm.Get(node)
-		if id == cid.LocalID {
-			continue
-		}
+	var selected protocol.NodeID
+	for _, node := range availability {
 		usage := m[node]
-		if availability&(1<<id) != 0 {
-			if usage < low {
-				low = usage
-				selected = node
-			}
+		if usage < low && isValid(node) {
+			low = usage
+			selected = node
 		}
 	}
 	m[selected]++
 	return selected
 }
 
-func (m activityMap) decrease(node string) {
+func (m activityMap) decrease(node protocol.NodeID) {
 	m[node]--
 }
 
@@ -134,9 +126,11 @@ func (p *puller) run() {
 		}
 	}()
 
-	walkTicker := time.Tick(time.Duration(p.cfg.Options.RescanIntervalS) * time.Second)
 	timeout := time.Tick(5 * time.Second)
 	changed := true
+	scanintv := time.Duration(p.cfg.Options.RescanIntervalS) * time.Second
+	lastscan := time.Now()
+	var prevVer uint64
 
 	for {
 		// Run the pulling loop as long as there are blocks to fetch
@@ -185,22 +179,26 @@ func (p *puller) run() {
 		p.model.setState(p.repoCfg.ID, RepoIdle)
 
 		// Do a rescan if it's time for it
-		select {
-		case <-walkTicker:
+		if time.Since(lastscan) > scanintv {
 			if debug {
 				l.Debugf("%q: time for rescan", p.repoCfg.ID)
 			}
+
 			err := p.model.ScanRepo(p.repoCfg.ID)
 			if err != nil {
 				invalidateRepo(p.cfg, p.repoCfg.ID, err)
 				return
 			}
-
-		default:
+			lastscan = time.Now()
 		}
 
-		// Queue more blocks to fetch, if any
-		p.queueNeededBlocks()
+		if v := p.model.LocalVersion(p.repoCfg.ID); v > prevVer {
+			// Queue more blocks to fetch, if any
+			if p.queueNeededBlocks() == 0 {
+				// We've fetched all blocks we need
+				prevVer = v
+			}
+		}
 	}
 }
 
@@ -242,7 +240,7 @@ func (p *puller) fixupDirectories() {
 		}
 
 		if filepath.Base(rn) == ".stversions" {
-			return nil
+			return filepath.SkipDir
 		}
 
 		cur := p.model.CurrentRepoFile(p.repoCfg.ID, rn)
@@ -279,22 +277,6 @@ func (p *puller) fixupDirectories() {
 			}
 		}
 
-		if cur.Modified != info.ModTime().Unix() {
-			t := time.Unix(cur.Modified, 0)
-			err := os.Chtimes(path, t, t)
-			if err != nil {
-				if runtime.GOOS != "windows" {
-					// https://code.google.com/p/go/issues/detail?id=8090
-					l.Warnf("Restoring folder modtime: %q: %v", path, err)
-				}
-			} else {
-				changed++
-				if debug {
-					l.Debugf("restored dir modtime: %d -> %v", info.ModTime().Unix(), cur)
-				}
-			}
-		}
-
 		return nil
 	}
 
@@ -313,8 +295,8 @@ func (p *puller) fixupDirectories() {
 			err := os.Remove(dir)
 			if err == nil {
 				deleted++
-			} else if p.versioner == nil { // Failures are expected in the presence of versioning
-				l.Warnln(err)
+			} else {
+				l.Warnln("Delete dir:", err)
 			}
 		}
 
@@ -338,15 +320,20 @@ func (p *puller) handleRequestResult(res requestResult) {
 		return
 	}
 
-	_, of.err = of.file.WriteAt(res.data, res.offset)
-	buffers.Put(res.data)
+	if res.err != nil {
+		of.err = res.err
+		if debug {
+			l.Debugf("pull: not writing %q / %q offset %d: %v", p.repoCfg.ID, f.Name, res.offset, res.err)
+		}
+	} else {
+		_, of.err = of.file.WriteAt(res.data, res.offset)
+		if debug {
+			l.Debugf("pull: wrote %q / %q offset %d len %d outstanding %d done %v", p.repoCfg.ID, f.Name, res.offset, len(res.data), of.outstanding, of.done)
+		}
+	}
 
 	of.outstanding--
 	p.openFiles[f.Name] = of
-
-	if debug {
-		l.Debugf("pull: wrote %q / %q offset %d outstanding %d done %v", p.repoCfg.ID, f.Name, res.offset, of.outstanding, of.done)
-	}
 
 	if of.done && of.outstanding == 0 {
 		p.closeFile(f)
@@ -369,7 +356,7 @@ func (p *puller) handleBlock(b bqBlock) bool {
 				if debug {
 					l.Debugf("create dir: %v", f)
 				}
-				err = os.MkdirAll(path, 0777)
+				err = os.MkdirAll(path, os.FileMode(f.Flags&0777))
 				if err != nil {
 					l.Warnf("Create folder: %q: %v", path, err)
 				}
@@ -400,6 +387,11 @@ func (p *puller) handleBlock(b bqBlock) bool {
 			}
 		}
 
+		events.Default.Log(events.ItemStarted, map[string]string{
+			"repo": p.repoCfg.ID,
+			"item": f.Name,
+		})
+
 		p.model.updateLocal(p.repoCfg.ID, f)
 		return true
 	}
@@ -412,7 +404,12 @@ func (p *puller) handleBlock(b bqBlock) bool {
 			l.Debugf("pull: %q: opening file %q", p.repoCfg.ID, f.Name)
 		}
 
-		of.availability = uint64(p.model.repoFiles[p.repoCfg.ID].Availability(f.Name))
+		events.Default.Log(events.ItemStarted, map[string]string{
+			"repo": p.repoCfg.ID,
+			"item": f.Name,
+		})
+
+		of.availability = p.model.repoFiles[p.repoCfg.ID].Availability(f.Name)
 		of.filepath = filepath.Join(p.repoCfg.Directory, f.Name)
 		of.temp = filepath.Join(p.repoCfg.Directory, defTempNamer.TempName(f.Name))
 
@@ -490,12 +487,11 @@ func (p *puller) handleCopyBlock(b bqBlock) {
 	defer exfd.Close()
 
 	for _, b := range b.copy {
-		bs := buffers.Get(int(b.Size))
+		bs := make([]byte, b.Size)
 		_, of.err = exfd.ReadAt(bs, b.Offset)
 		if of.err == nil {
 			_, of.err = of.file.WriteAt(bs, b.Offset)
 		}
-		buffers.Put(bs)
 		if of.err != nil {
 			if debug {
 				l.Debugf("pull: error: %q / %q: %v", p.repoCfg.ID, f.Name, of.err)
@@ -520,8 +516,8 @@ func (p *puller) handleRequestBlock(b bqBlock) bool {
 		panic("bug: request for non-open file")
 	}
 
-	node := p.oustandingPerNode.leastBusyNode(of.availability, p.model.cm)
-	if len(node) == 0 {
+	node := p.oustandingPerNode.leastBusyNode(of.availability, p.model.ConnectedTo)
+	if node == (protocol.NodeID{}) {
 		of.err = errNoNode
 		if of.file != nil {
 			of.file.Close()
@@ -539,7 +535,7 @@ func (p *puller) handleRequestBlock(b bqBlock) bool {
 	of.outstanding++
 	p.openFiles[f.Name] = of
 
-	go func(node string, b bqBlock) {
+	go func(node protocol.NodeID, b bqBlock) {
 		if debug {
 			l.Debugf("pull: requesting %q / %q offset %d size %d from %q outstanding %d", p.repoCfg.ID, f.Name, b.block.Offset, b.block.Size, node, of.outstanding)
 		}
@@ -575,8 +571,13 @@ func (p *puller) handleEmptyBlock(b bqBlock) {
 		os.Remove(of.temp)
 		os.Chmod(of.filepath, 0666)
 		if p.versioner != nil {
-			if err := p.versioner.Archive(of.filepath); err == nil {
+			if debug {
+				l.Debugln("pull: deleting with versioner")
+			}
+			if err := p.versioner.Archive(p.repoCfg.Directory, of.filepath); err == nil {
 				p.model.updateLocal(p.repoCfg.ID, f)
+			} else if debug {
+				l.Debugln("pull: error:", err)
 			}
 		} else if err := os.Remove(of.filepath); err == nil || os.IsNotExist(err) {
 			p.model.updateLocal(p.repoCfg.ID, f)
@@ -602,7 +603,7 @@ func (p *puller) handleEmptyBlock(b bqBlock) {
 	delete(p.openFiles, f.Name)
 }
 
-func (p *puller) queueNeededBlocks() {
+func (p *puller) queueNeededBlocks() int {
 	queued := 0
 	for _, f := range p.model.NeedFilesRepo(p.repoCfg.ID) {
 		lf := p.model.CurrentRepoFile(p.repoCfg.ID, f.Name)
@@ -618,11 +619,12 @@ func (p *puller) queueNeededBlocks() {
 		})
 	}
 	if debug && queued > 0 {
-		l.Debugf("%q: queued %d blocks", p.repoCfg.ID, queued)
+		l.Debugf("%q: queued %d items", p.repoCfg.ID, queued)
 	}
+	return queued
 }
 
-func (p *puller) closeFile(f scanner.File) {
+func (p *puller) closeFile(f protocol.FileInfo) {
 	if debug {
 		l.Debugf("pull: closing %q / %q", p.repoCfg.ID, f.Name)
 	}
@@ -652,7 +654,7 @@ func (p *puller) closeFile(f scanner.File) {
 
 	for i := range hb {
 		if bytes.Compare(hb[i].Hash, f.Blocks[i].Hash) != 0 {
-			l.Debugf("pull: %q / %q: block %d hash mismatch", p.repoCfg.ID, f.Name, i)
+			l.Debugf("pull: %q / %q: block %d hash mismatch\n\thave: %x\n\twant: %x", p.repoCfg.ID, f.Name, i, hb[i].Hash, f.Blocks[i].Hash)
 			return
 		}
 	}
@@ -672,7 +674,7 @@ func (p *puller) closeFile(f scanner.File) {
 	osutil.ShowFile(of.temp)
 
 	if p.versioner != nil {
-		err := p.versioner.Archive(of.filepath)
+		err := p.versioner.Archive(p.repoCfg.Directory, of.filepath)
 		if err != nil {
 			if debug {
 				l.Debugf("pull: error: %q / %q: %v", p.repoCfg.ID, f.Name, err)

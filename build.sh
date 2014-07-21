@@ -21,9 +21,6 @@ check() {
 
 build() {
 	check
-
-	go vet ./...
-
 	godep go build $* -ldflags "$ldflags" ./cmd/syncthing
 }
 
@@ -49,6 +46,7 @@ test-cov() {
 
 test() {
 	check
+	go vet ./...
 	godep go test -cpu=1,2,4 ./...
 }
 
@@ -77,8 +75,7 @@ zipDist() {
 	rm -rf "$name"
 	mkdir -p "$name"
 	for f in "${distFiles[@]}" ; do
-		sed 's/$/
-/' < "$f" > "$name/$f.txt"
+		GOARCH="" GOOS="" go run cmd/todos/main.go < "$f" > "$name/$f.txt"
 	done
 	cp syncthing.exe "$name"
 	sign "$name/syncthing.exe"
@@ -96,6 +93,12 @@ setup() {
 	go get -u github.com/tools/godep
 	echo Installing go vet...
 	go get -u code.google.com/p/go.tools/cmd/vet
+}
+
+xdr() {
+	for f in discover/packets files/leveldb protocol/message ; do
+		go run xdr/cmd/genxdr/main.go -- "${f}.go" > "${f}_xdr.go"
+	done
 }
 
 case "$1" in
@@ -139,10 +142,8 @@ case "$1" in
 		assets
 
 		godep go build ./discover/cmd/discosrv
-		godep go build ./cmd/stpidx
-		godep go build ./cmd/stcli
 
-		for os in darwin-amd64 linux-386 linux-amd64 freebsd-amd64 windows-amd64 windows-386 solaris-amd64 ; do
+		for os in darwin-amd64 linux-386 linux-amd64 freebsd-amd64 windows-amd64 windows-386 ; do
 			export GOOS=${os%-*}
 			export GOARCH=${os#*-}
 
@@ -201,6 +202,10 @@ case "$1" in
 
 	setup)
 		setup
+		;;
+
+	xdr)
+		xdr
 		;;
 
 	*)

@@ -23,8 +23,9 @@ var stopUsageReportingCh = make(chan struct{})
 
 func reportData(m *model.Model) map[string]interface{} {
 	res := make(map[string]interface{})
-	res["uniqueID"] = strings.ToLower(certID([]byte(myID)))[:6]
+	res["uniqueID"] = strings.ToLower(myID.String()[:6])
 	res["version"] = Version
+	res["longVersion"] = LongVersion
 	res["platform"] = runtime.GOOS + "-" + runtime.GOARCH
 	res["numRepos"] = len(cfg.Repositories)
 	res["numNodes"] = len(cfg.Nodes)
@@ -107,7 +108,10 @@ loop:
 }
 
 func stopUsageReporting() {
-	stopUsageReportingCh <- struct{}{}
+	select {
+	case stopUsageReportingCh <- struct{}{}:
+	default:
+	}
 }
 
 // Returns CPU performance as a measure of single threaded SHA-256 MiB/s

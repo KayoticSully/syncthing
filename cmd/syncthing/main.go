@@ -1,6 +1,6 @@
-// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
-// Use of this source code is governed by an MIT-style license that can be
-// found in the LICENSE file.
+// Copyright (C) 2014 Jakob Borg and Contributors (see the CONTRIBUTORS file).
+// All rights reserved. Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
 
 package main
 
@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"runtime/pprof"
@@ -27,12 +28,14 @@ import (
 
 	"github.com/calmh/syncthing/config"
 	"github.com/calmh/syncthing/discover"
+	"github.com/calmh/syncthing/events"
 	"github.com/calmh/syncthing/logger"
 	"github.com/calmh/syncthing/model"
 	"github.com/calmh/syncthing/osutil"
 	"github.com/calmh/syncthing/protocol"
 	"github.com/calmh/syncthing/upnp"
 	"github.com/juju/ratelimit"
+	"github.com/syndtr/goleveldb/leveldb"
 )
 
 var (
@@ -48,6 +51,14 @@ var (
 var l = logger.DefaultLogger
 
 func init() {
+	if Version != "unknown-dev" {
+		// If not a generic dev build, version string should come from git describe
+		exp := regexp.MustCompile(`^v\d+\.\d+\.\d+(-beta\d+)?(-\d+-g[0-9a-f]+)?(-dirty)?$`)
+		if !exp.MatchString(Version) {
+			l.Fatalf("Invalid version string %q;\n\tdoes not match regexp %v", Version, exp)
+		}
+	}
+
 	stamp, _ := strconv.Atoi(BuildStamp)
 	BuildDate = time.Unix(int64(stamp), 0)
 
@@ -61,7 +72,7 @@ func init() {
 
 var (
 	cfg        config.Configuration
-	myID       string
+	myID       protocol.NodeID
 	confDir    string
 	logFlags   int = log.Ltime
 	rateBucket *ratelimit.Bucket
@@ -106,7 +117,9 @@ The following enviroment variables are interpreted by syncthing:
 
  STCPUPROFILE  Write CPU profile to the specified file.
 
- STGUIASSETS   Directory to load GUI assets from. Overrides compiled in assets.`
+ STGUIASSETS   Directory to load GUI assets from. Overrides compiled in assets.
+
+ STDEADLOCKTIMEOUT  Alter deadlock detection timeout (seconds; default 1200).`
 )
 
 func init() {
@@ -150,6 +163,8 @@ func main() {
 
 	confDir = expandTilde(confDir)
 
+	events.Default.Log(events.Starting, map[string]string{"home": confDir})
+
 	if _, err := os.Stat(confDir); err != nil && confDir == getDefaultConfDir() {
 		// We are supposed to use the default configuration directory. It
 		// doesn't exist. In the past our default has been ~/.syncthing, so if
@@ -181,8 +196,8 @@ func main() {
 		l.FatalErr(err)
 	}
 
-	myID = certID(cert.Certificate[0])
-	l.SetPrefix(fmt.Sprintf("[%s] ", myID[:5]))
+	myID = protocol.NewNodeID(cert.Certificate[0])
+	l.SetPrefix(fmt.Sprintf("[%s] ", myID.String()[:5]))
 
 	l.Infoln(LongVersion)
 	l.Infoln("My ID:", myID)
@@ -263,7 +278,7 @@ func main() {
 	tlsCfg := &tls.Config{
 		Certificates:           []tls.Certificate{cert},
 		NextProtos:             []string{"bep/1.0"},
-		ServerName:             myID,
+		ServerName:             myID.String(),
 		ClientAuth:             tls.RequestClientCert,
 		SessionTicketsDisabled: true,
 		InsecureSkipVerify:     true,
@@ -277,7 +292,12 @@ func main() {
 		rateBucket = ratelimit.NewBucketWithRate(float64(1000*cfg.Options.MaxSendKbps), int64(5*1000*cfg.Options.MaxSendKbps))
 	}
 
-	m := model.NewModel(confDir, &cfg, "syncthing", Version)
+	removeLegacyIndexes()
+	db, err := leveldb.OpenFile(filepath.Join(confDir, "index"), nil)
+	if err != nil {
+		l.Fatalln("leveldb.OpenFile():", err)
+	}
+	m := model.NewModel(confDir, &cfg, "syncthing", Version, db)
 
 nextRepo:
 	for i, repo := range cfg.Repositories {
@@ -342,11 +362,9 @@ nextRepo:
 	// Walk the repository and update the local model before establishing any
 	// connections to other nodes.
 
-	l.Infoln("Populating repository index")
-	m.LoadIndexes(confDir)
 	m.CleanRepos()
+	l.Infoln("Performing initial repository scan")
 	m.ScanRepos()
-	m.SaveIndexes(confDir)
 
 	// Remove all .idx* files that don't belong to an active repo.
 
@@ -415,11 +433,11 @@ nextRepo:
 		}
 	}
 
-	if cfg.Options.UREnabled && cfg.Options.URAccepted < usageReportVersion {
+	if cfg.Options.URAccepted > 0 && cfg.Options.URAccepted < usageReportVersion {
 		l.Infoln("Anonymous usage report has changed; revoking acceptance")
-		cfg.Options.UREnabled = false
+		cfg.Options.URAccepted = 0
 	}
-	if cfg.Options.UREnabled {
+	if cfg.Options.URAccepted >= usageReportVersion {
 		go usageReportingLoop(m)
 		go func() {
 			time.Sleep(10 * time.Minute)
@@ -430,8 +448,19 @@ nextRepo:
 		}()
 	}
 
+	events.Default.Log(events.StartupComplete, nil)
+	go generateEvents()
+
 	<-stop
+
 	l.Okln("Exiting")
+}
+
+func generateEvents() {
+	for {
+		time.Sleep(300 * time.Second)
+		events.Default.Log(events.Ping, nil)
+	}
 }
 
 func waitForParentExit() {
@@ -472,7 +501,10 @@ func setupUPnP(r rand.Source) int {
 					l.Warnln("Failed to create UPnP port mapping")
 				}
 			} else {
-				l.Infof("No UPnP IGD device found, no port mapping created (%v)", err)
+				l.Infof("No UPnP gateway detected")
+				if debugNet {
+					l.Debugf("UPnP: %v", err)
+				}
 			}
 		}
 	} else {
@@ -490,7 +522,12 @@ func resetRepositories() {
 		}
 	}
 
-	pat := filepath.Join(confDir, "*.idx.gz")
+	idx := filepath.Join(confDir, "index")
+	os.RemoveAll(idx)
+}
+
+func removeLegacyIndexes() {
+	pat := filepath.Join(confDir, "*.idx.gz*")
 	idxs, err := filepath.Glob(pat)
 	if err == nil {
 		for _, idx := range idxs {
@@ -567,103 +604,16 @@ func saveConfig() {
 	saveConfigCh <- struct{}{}
 }
 
-func listenConnect(myID string, m *model.Model, tlsCfg *tls.Config) {
+func listenConnect(myID protocol.NodeID, m *model.Model, tlsCfg *tls.Config) {
 	var conns = make(chan *tls.Conn)
 
 	// Listen
 	for _, addr := range cfg.Options.ListenAddress {
-		addr := addr
-		go func() {
-			if debugNet {
-				l.Debugln("listening on", addr)
-			}
-			listener, err := tls.Listen("tcp", addr, tlsCfg)
-			l.FatalErr(err)
-
-			for {
-				conn, err := listener.Accept()
-				if err != nil {
-					l.Warnln(err)
-					continue
-				}
-
-				if debugNet {
-					l.Debugln("connect from", conn.RemoteAddr())
-				}
-
-				tc := conn.(*tls.Conn)
-				err = tc.Handshake()
-				if err != nil {
-					l.Warnln(err)
-					tc.Close()
-					continue
-				}
-
-				conns <- tc
-			}
-		}()
+		go listenTLS(conns, addr, tlsCfg)
 	}
 
 	// Connect
-	go func() {
-		var delay time.Duration = 1 * time.Second
-		for {
-		nextNode:
-			for _, nodeCfg := range cfg.Nodes {
-				if nodeCfg.NodeID == myID {
-					continue
-				}
-				if m.ConnectedTo(nodeCfg.NodeID) {
-					continue
-				}
-
-				var addrs []string
-				for _, addr := range nodeCfg.Addresses {
-					if addr == "dynamic" {
-						if discoverer != nil {
-							t := discoverer.Lookup(nodeCfg.NodeID)
-							if len(t) == 0 {
-								continue
-							}
-							addrs = append(addrs, t...)
-						}
-					} else {
-						addrs = append(addrs, addr)
-					}
-				}
-
-				for _, addr := range addrs {
-					host, port, err := net.SplitHostPort(addr)
-					if err != nil && strings.HasPrefix(err.Error(), "missing port") {
-						// addr is on the form "1.2.3.4"
-						addr = net.JoinHostPort(addr, "22000")
-					} else if err == nil && port == "" {
-						// addr is on the form "1.2.3.4:"
-						addr = net.JoinHostPort(host, "22000")
-					}
-					if debugNet {
-						l.Debugln("dial", nodeCfg.NodeID, addr)
-					}
-					conn, err := tls.Dial("tcp", addr, tlsCfg)
-					if err != nil {
-						if debugNet {
-							l.Debugln(err)
-						}
-						continue
-					}
-
-					conns <- conn
-					continue nextNode
-				}
-			}
-
-			time.Sleep(delay)
-			delay *= 2
-			if maxD := time.Duration(cfg.Options.ReconnectIntervalS) * time.Second; delay > maxD {
-				delay = maxD
-			}
-		}
-	}()
+	go dialTLS(m, conns, tlsCfg)
 
 next:
 	for conn := range conns {
@@ -673,7 +623,7 @@ next:
 			conn.Close()
 			continue
 		}
-		remoteID := certID(certs[0].Raw)
+		remoteID := protocol.NewNodeID(certs[0].Raw)
 
 		if remoteID == myID {
 			l.Infof("Connected to myself (%s) - should not happen", remoteID)
@@ -693,7 +643,18 @@ next:
 				if rateBucket != nil {
 					wr = &limitedWriter{conn, rateBucket}
 				}
-				protoConn := protocol.NewConnection(remoteID, conn, wr, m)
+				name := fmt.Sprintf("%s-%s", conn.LocalAddr(), conn.RemoteAddr())
+				protoConn := protocol.NewConnection(remoteID, conn, wr, m, name)
+
+				l.Infof("Established secure connection to %s at %s", remoteID, name)
+				if debugNet {
+					l.Debugf("cipher suite %04X", conn.ConnectionState().CipherSuite)
+				}
+				events.Default.Log(events.NodeConnected, map[string]string{
+					"id":   remoteID.String(),
+					"addr": conn.RemoteAddr().String(),
+				})
+
 				m.AddConnection(conn, protoConn)
 				continue next
 			}
@@ -701,6 +662,139 @@ next:
 
 		l.Infof("Connection from %s with unknown node ID %s; ignoring", conn.RemoteAddr(), remoteID)
 		conn.Close()
+	}
+}
+
+func listenTLS(conns chan *tls.Conn, addr string, tlsCfg *tls.Config) {
+	if debugNet {
+		l.Debugln("listening on", addr)
+	}
+
+	tcaddr, err := net.ResolveTCPAddr("tcp", addr)
+	l.FatalErr(err)
+	listener, err := net.ListenTCP("tcp", tcaddr)
+	l.FatalErr(err)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			l.Warnln(err)
+			continue
+		}
+
+		if debugNet {
+			l.Debugln("connect from", conn.RemoteAddr())
+		}
+
+		tcpConn := conn.(*net.TCPConn)
+		setTCPOptions(tcpConn)
+
+		tc := tls.Server(conn, tlsCfg)
+		err = tc.Handshake()
+		if err != nil {
+			l.Warnln(err)
+			tc.Close()
+			continue
+		}
+
+		conns <- tc
+	}
+
+}
+
+func dialTLS(m *model.Model, conns chan *tls.Conn, tlsCfg *tls.Config) {
+	var delay time.Duration = 1 * time.Second
+	for {
+	nextNode:
+		for _, nodeCfg := range cfg.Nodes {
+			if nodeCfg.NodeID == myID {
+				continue
+			}
+
+			if m.ConnectedTo(nodeCfg.NodeID) {
+				continue
+			}
+
+			var addrs []string
+			for _, addr := range nodeCfg.Addresses {
+				if addr == "dynamic" {
+					if discoverer != nil {
+						t := discoverer.Lookup(nodeCfg.NodeID)
+						if len(t) == 0 {
+							continue
+						}
+						addrs = append(addrs, t...)
+					}
+				} else {
+					addrs = append(addrs, addr)
+				}
+			}
+
+			for _, addr := range addrs {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil && strings.HasPrefix(err.Error(), "missing port") {
+					// addr is on the form "1.2.3.4"
+					addr = net.JoinHostPort(addr, "22000")
+				} else if err == nil && port == "" {
+					// addr is on the form "1.2.3.4:"
+					addr = net.JoinHostPort(host, "22000")
+				}
+				if debugNet {
+					l.Debugln("dial", nodeCfg.NodeID, addr)
+				}
+
+				raddr, err := net.ResolveTCPAddr("tcp", addr)
+				if err != nil {
+					if debugNet {
+						l.Debugln(err)
+					}
+					continue
+				}
+
+				conn, err := net.DialTCP("tcp", nil, raddr)
+				if err != nil {
+					if debugNet {
+						l.Debugln(err)
+					}
+					continue
+				}
+
+				setTCPOptions(conn)
+
+				tc := tls.Client(conn, tlsCfg)
+				err = tc.Handshake()
+				if err != nil {
+					l.Warnln(err)
+					tc.Close()
+					continue
+				}
+
+				conns <- tc
+				continue nextNode
+			}
+		}
+
+		time.Sleep(delay)
+		delay *= 2
+		if maxD := time.Duration(cfg.Options.ReconnectIntervalS) * time.Second; delay > maxD {
+			delay = maxD
+		}
+	}
+}
+
+func setTCPOptions(conn *net.TCPConn) {
+	var err error
+	if err = conn.SetLinger(0); err != nil {
+		l.Infoln(err)
+	}
+	if err = conn.SetNoDelay(false); err != nil {
+		l.Infoln(err)
+	}
+	if err = conn.SetKeepAlivePeriod(60 * time.Second); err != nil {
+		l.Infoln(err)
+	}
+	if err = conn.SetKeepAlive(true); err != nil {
+		l.Infoln(err)
 	}
 }
 

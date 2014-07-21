@@ -1,21 +1,27 @@
-// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
-// Use of this source code is governed by an MIT-style license that can be
-// found in the LICENSE file.
+// Copyright (C) 2014 Jakob Borg and Contributors (see the CONTRIBUTORS file).
+// All rights reserved. Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
 
 /*jslint browser: true, continue: true, plusplus: true */
 /*global $: false, angular: false */
 
 'use strict';
 
-var syncthing = angular.module('syncthing', []);
+var syncthing = angular.module('syncthing', ['pascalprecht.translate']);
 var urlbase = 'rest';
 
-syncthing.config(function ($httpProvider) {
+syncthing.config(function ($httpProvider, $translateProvider) {
     $httpProvider.defaults.xsrfHeaderName = 'X-CSRF-Token';
     $httpProvider.defaults.xsrfCookieName = 'CSRF-Token';
+
+    $translateProvider.useStaticFilesLoader({
+        prefix: 'lang-',
+        suffix: '.json'
+    });
+    $translateProvider.preferredLanguage('en');
 });
 
-syncthing.controller('SyncthingCtrl', function ($scope, $http) {
+syncthing.controller('SyncthingCtrl', function ($scope, $http, $translate) {
     var prevDate = 0;
     var getOK = true;
     var restarting = false;
@@ -32,6 +38,7 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
     $scope.repos = {};
     $scope.reportData = {};
     $scope.reportPreview = false;
+    $scope.upgradeInfo = {};
 
     $scope.needActions = {
         'rm': 'Del',
@@ -45,31 +52,6 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
         'sync': 'download',
         'touch': 'asterisk',
     }
-
-    // Strings before bools look better
-    $scope.settings = [
-    {id: 'ListenStr', descr: 'Sync Protocol Listen Addresses', type: 'text'},
-    {id: 'MaxSendKbps', descr: 'Outgoing Rate Limit (KiB/s)', type: 'number'},
-    {id: 'RescanIntervalS', descr: 'Rescan Interval (s)', type: 'number'},
-    {id: 'ReconnectIntervalS', descr: 'Reconnect Interval (s)', type: 'number'},
-    {id: 'ParallelRequests', descr: 'Max Outstanding Requests', type: 'number'},
-    {id: 'MaxChangeKbps', descr: 'Max File Change Rate (KiB/s)', type: 'number'},
-
-    {id: 'LocalAnnPort', descr: 'Local Discovery Port', type: 'number'},
-    {id: 'LocalAnnEnabled', descr: 'Local Discovery', type: 'bool'},
-    {id: 'GlobalAnnEnabled', descr: 'Global Discovery', type: 'bool'},
-    {id: 'StartBrowser', descr: 'Start Browser', type: 'bool'},
-    {id: 'UPnPEnabled', descr: 'Enable UPnP', type: 'bool'},
-    {id: 'UREnabled', descr: 'Anonymous Usage Reporting', type: 'bool'},
-    ];
-
-    $scope.guiSettings = [
-    {id: 'Address', descr: 'GUI Listen Addresses', type: 'text', restart: true},
-    {id: 'User', descr: 'GUI Authentication User', type: 'text', restart: true},
-    {id: 'Password', descr: 'GUI Authentication Password', type: 'password', restart: true},
-    {id: 'UseTLS', descr: 'Use HTTPS for GUI', type: 'bool', restart: true},
-    {id: 'APIKey', descr: 'API Key', type: 'apikey'},
-    ];
 
     function getSucceeded() {
         if (!getOK) {
@@ -103,9 +85,20 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
             getFailed();
         });
         Object.keys($scope.repos).forEach(function (id) {
-            $http.get(urlbase + '/model?repo=' + encodeURIComponent(id)).success(function (data) {
-                $scope.model[id] = data;
-            });
+            if (typeof $scope.model[id] === 'undefined') {
+                // Never fetched before
+                $http.get(urlbase + '/model?repo=' + encodeURIComponent(id)).success(function (data) {
+                    $scope.model[id] = data;
+                });
+            } else {
+                $http.get(urlbase + '/model/version?repo=' + encodeURIComponent(id)).success(function (data) {
+                    if (data.version > $scope.model[id].version) {
+                        $http.get(urlbase + '/model?repo=' + encodeURIComponent(id)).success(function (data) {
+                            $scope.model[id] = data;
+                        });
+                    }
+                });
+            }
         });
         $http.get(urlbase + '/connections').success(function (data) {
             var now = Date.now(),
@@ -279,8 +272,9 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
 
     $scope.editSettings = function () {
         // Make a working copy
-        $scope.config.workingOptions = angular.copy($scope.config.Options);
-        $scope.config.workingGUI = angular.copy($scope.config.GUI);
+        $scope.tmpOptions = angular.copy($scope.config.Options);
+        $scope.tmpOptions.UREnabled = ($scope.tmpOptions.URAccepted > 0);
+        $scope.tmpGUI = angular.copy($scope.config.GUI);
         $('#settings').modal({backdrop: 'static', keyboard: true});
     };
 
@@ -296,17 +290,24 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
 
     $scope.saveSettings = function () {
         // Make sure something changed
-        var changed = ! angular.equals($scope.config.Options, $scope.config.workingOptions) ||
-                      ! angular.equals($scope.config.GUI, $scope.config.workingGUI);
-        if(changed){
-            // see if protocol will need to be changed on restart
-            if($scope.config.GUI.UseTLS !== $scope.config.workingGUI.UseTLS){
+        var changed = !angular.equals($scope.config.Options, $scope.tmpOptions) ||
+                      !angular.equals($scope.config.GUI, $scope.tmpGUI);
+        if (changed) {
+            // Check if usage reporting has been enabled or disabled
+            if ($scope.tmpOptions.UREnabled && $scope.tmpOptions.URAccepted <= 0) {
+                $scope.tmpOptions.URAccepted = 1000;
+            } else if (!$scope.tmpOptions.UREnabled && $scope.tmpOptions.URAccepted > 0){
+                $scope.tmpOptions.URAccepted = -1;
+            }
+
+            // Check if protocol will need to be changed on restart
+            if($scope.config.GUI.UseTLS !== $scope.tmpGUI.UseTLS){
                 $scope.protocolChanged = true;
             }
 
             // Apply new settings locally
-            $scope.config.Options = angular.copy($scope.config.workingOptions);
-            $scope.config.GUI = angular.copy($scope.config.workingGUI);
+            $scope.config.Options = angular.copy($scope.tmpOptions);
+            $scope.config.GUI = angular.copy($scope.tmpGUI);
             $scope.config.Options.ListenAddress = $scope.config.Options.ListenStr.split(',').map(function (x) { return x.trim(); });
 
             $scope.saveConfig();
@@ -317,6 +318,8 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
 
     $scope.restart = function () {
         restarting = true;
+        $scope.restartingTitle = "Restarting"
+        $scope.restartingBody = "Syncthing is restarting."
         $('#restarting').modal({backdrop: 'static', keyboard: false});
         $http.post(urlbase + '/restart');
         $scope.configInSync = true;
@@ -335,6 +338,18 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
 
             $scope.protocolChanged = false;
         }
+    };
+
+    $scope.upgrade = function () {
+        $scope.restartingTitle = "Upgrading"
+        $scope.restartingBody = "Syncthing is upgrading."
+        $('#restarting').modal({backdrop: 'static', keyboard: false});
+        $http.post(urlbase + '/upgrade').success(function () {
+            restarting = true;
+            $scope.restartingBody = "Syncthing is restarting into the new version."
+        }).error(function () {
+            $('#restarting').modal('hide');
+        });
     };
 
     $scope.shutdown = function () {
@@ -391,7 +406,7 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
 
         $('#editNode').modal('hide');
         nodeCfg = $scope.currentNode;
-        nodeCfg.NodeID = nodeCfg.NodeID.replace(/ /g, '').replace(/-/g, '').toUpperCase().trim();
+        nodeCfg.NodeID = nodeCfg.NodeID.replace(/ /g, '').replace(/-/g, '').toLowerCase().trim();
         nodeCfg.Addresses = nodeCfg.AddressesStr.split(',').map(function (x) { return x.trim(); });
 
         done = false;
@@ -561,7 +576,7 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
 
             $scope.refresh();
 
-            if (!$scope.config.Options.UREnabled && !$scope.config.Options.URDeclined) {
+            if ($scope.config.Options.URAccepted == 0) {
                 // If usage reporting has been neither accepted nor declined,
                 // we want to ask the user to make a choice. But we don't want
                 // to bug them during initial setup, so we set a cookie with
@@ -587,18 +602,22 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
         $http.get(urlbase + '/report').success(function (data) {
             $scope.reportData = data;
         });
+
+        $http.get(urlbase + '/upgrade').success(function (data) {
+            $scope.upgradeInfo = data;
+        }).error(function () {
+            $scope.upgradeInfo = {};
+        });
     };
 
     $scope.acceptUR = function () {
-        $scope.config.Options.UREnabled = true;
-        $scope.config.Options.URDeclined = false;
+        $scope.config.Options.URAccepted = 1000; // Larger than the largest existing report version
         $scope.saveConfig();
         $('#ur').modal('hide');
     };
 
     $scope.declineUR = function () {
-        $scope.config.Options.UREnabled = false;
-        $scope.config.Options.URDeclined = true;
+        $scope.config.Options.URAccepted = -1;
         $scope.saveConfig();
         $('#ur').modal('hide');
     };
@@ -631,6 +650,10 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http) {
         $http.post(urlbase + "/model/override?repo=" + encodeURIComponent(repo)).success(function () {
             $scope.refresh();
         });
+    };
+
+    $scope.about = function () {
+        $('#about').modal('show');
     };
 
     $scope.init();
@@ -694,7 +717,7 @@ function randomString(len, bits)
         newStr = Math.random().toString(bits).slice(2);
         outStr += newStr.slice(0, Math.min(newStr.length, (len - outStr.length)));
     }
-    return outStr.toUpperCase();
+    return outStr.toLowerCase();
 }
 
 syncthing.filter('natural', function () {
@@ -757,17 +780,6 @@ syncthing.filter('alwaysNumber', function () {
             return 0;
         }
         return input;
-    };
-});
-
-syncthing.filter('chunkID', function () {
-    return function (input) {
-        if (input === undefined)
-            return "";
-        var parts = input.match(/.{1,6}/g);
-        if (!parts)
-            return "";
-        return parts.join('-');
     };
 });
 
@@ -834,7 +846,7 @@ syncthing.directive('uniqueRepo', function() {
     };
 });
 
-syncthing.directive('validNodeid', function() {
+syncthing.directive('validNodeid', function($http) {
     return {
         require: 'ngModel',
         link: function(scope, elm, attrs, ctrl) {
@@ -843,15 +855,32 @@ syncthing.directive('validNodeid', function() {
                     // we shouldn't validate
                     ctrl.$setValidity('validNodeid', true);
                 } else {
-                    var cleaned = viewValue.replace(/ /g, '').replace(/-/g, '').toUpperCase().trim();
-                    if (cleaned.match(/^[A-Z2-7]{52}$/)) {
-                        ctrl.$setValidity('validNodeid', true);
-                    } else {
-                        ctrl.$setValidity('validNodeid', false);
-                    }
+                    $http.get(urlbase + '/nodeid?id='+viewValue).success(function (resp) {
+                        if (resp.error) {
+                            ctrl.$setValidity('validNodeid', false);
+                        } else {
+                            ctrl.$setValidity('validNodeid', true);
+                        }
+                    });
                 }
                 return viewValue;
             });
         }
     };
+});
+
+syncthing.directive('modal', function () {
+    return {
+        restrict: 'E',
+        templateUrl: 'modal.html',
+        replace: true,
+        transclude: true,
+        scope: {
+            title: '@',
+            status: '@',
+            icon: '@',
+            close: '@',
+            large: '@',
+        },
+    }
 });

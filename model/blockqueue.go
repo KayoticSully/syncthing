@@ -1,25 +1,25 @@
-// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
-// Use of this source code is governed by an MIT-style license that can be
-// found in the LICENSE file.
+// Copyright (C) 2014 Jakob Borg and Contributors (see the CONTRIBUTORS file).
+// All rights reserved. Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
 
 package model
 
 import (
 	"sync"
 
-	"github.com/calmh/syncthing/scanner"
+	"github.com/calmh/syncthing/protocol"
 )
 
 type bqAdd struct {
-	file scanner.File
-	have []scanner.Block
-	need []scanner.Block
+	file protocol.FileInfo
+	have []protocol.BlockInfo
+	need []protocol.BlockInfo
 }
 
 type bqBlock struct {
-	file  scanner.File
-	block scanner.Block   // get this block from the network
-	copy  []scanner.Block // copy these blocks from the old version of the file
+	file  protocol.FileInfo
+	block protocol.BlockInfo   // get this block from the network
+	copy  []protocol.BlockInfo // copy these blocks from the old version of the file
 	first bool
 	last  bool
 }

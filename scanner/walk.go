@@ -1,12 +1,13 @@
-// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
-// Use of this source code is governed by an MIT-style license that can be
-// found in the LICENSE file.
+// Copyright (C) 2014 Jakob Borg and Contributors (see the CONTRIBUTORS file).
+// All rights reserved. Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
 
 package scanner
 
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -54,12 +55,12 @@ type Suppressor interface {
 
 type CurrentFiler interface {
 	// CurrentFile returns the file as seen at last scan.
-	CurrentFile(name string) File
+	CurrentFile(name string) protocol.FileInfo
 }
 
 // Walk returns the list of files found in the local repository by scanning the
 // file system. Files are blockwise hashed.
-func (w *Walker) Walk() (files []File, ignore map[string][]string, err error) {
+func (w *Walker) Walk() (files chan protocol.FileInfo, ignore map[string][]string, err error) {
 	if debug {
 		l.Debugln("Walk", w.Dir, w.BlockSize, w.IgnoreFile)
 	}
@@ -69,21 +70,16 @@ func (w *Walker) Walk() (files []File, ignore map[string][]string, err error) {
 		return
 	}
 
-	t0 := time.Now()
-
 	ignore = make(map[string][]string)
-	hashFiles := w.walkAndHashFiles(&files, ignore)
+	files = make(chan protocol.FileInfo)
+	hashFiles := w.walkAndHashFiles(files, ignore)
 
-	filepath.Walk(w.Dir, w.loadIgnoreFiles(w.Dir, ignore))
-	filepath.Walk(w.Dir, hashFiles)
+	go func() {
+		filepath.Walk(w.Dir, w.loadIgnoreFiles(w.Dir, ignore))
+		filepath.Walk(w.Dir, hashFiles)
+		close(files)
+	}()
 
-	if debug {
-		t1 := time.Now()
-		d := t1.Sub(t0).Seconds()
-		l.Debugf("Walk in %.02f ms, %.0f files/s", d*1000, float64(len(files))/d)
-	}
-
-	err = checkDir(w.Dir)
 	return
 }
 
@@ -104,13 +100,14 @@ func (w *Walker) loadIgnoreFiles(dir string, ign map[string][]string) filepath.W
 		}
 
 		if pn, sn := filepath.Split(rn); sn == w.IgnoreFile {
-			pn := strings.Trim(pn, "/")
+			pn := filepath.Clean(pn)
 			bs, _ := ioutil.ReadFile(p)
 			lines := bytes.Split(bs, []byte("\n"))
 			var patterns []string
 			for _, line := range lines {
-				if len(line) > 0 {
-					patterns = append(patterns, string(line))
+				lineStr := strings.TrimSpace(string(line))
+				if len(lineStr) > 0 {
+					patterns = append(patterns, lineStr)
 				}
 			}
 			ign[pn] = patterns
@@ -120,7 +117,7 @@ func (w *Walker) loadIgnoreFiles(dir string, ign map[string][]string) filepath.W
 	}
 }
 
-func (w *Walker) walkAndHashFiles(res *[]File, ign map[string][]string) filepath.WalkFunc {
+func (w *Walker) walkAndHashFiles(fchan chan protocol.FileInfo, ign map[string][]string) filepath.WalkFunc {
 	return func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			if debug {
@@ -169,31 +166,31 @@ func (w *Walker) walkAndHashFiles(res *[]File, ign map[string][]string) filepath
 			if w.CurrentFiler != nil {
 				cf := w.CurrentFiler.CurrentFile(rn)
 				permUnchanged := w.IgnorePerms || !protocol.HasPermissionBits(cf.Flags) || PermsEqual(cf.Flags, uint32(info.Mode()))
-				if cf.Modified == info.ModTime().Unix() && protocol.IsDirectory(cf.Flags) && permUnchanged {
+				if !protocol.IsDeleted(cf.Flags) && protocol.IsDirectory(cf.Flags) && permUnchanged {
 					if debug {
 						l.Debugln("unchanged:", cf)
 					}
-					*res = append(*res, cf)
-				} else {
-					var flags uint32 = protocol.FlagDirectory
-					if w.IgnorePerms {
-						flags |= protocol.FlagNoPermBits | 0777
-					} else {
-						flags |= uint32(info.Mode() & os.ModePerm)
-					}
-					f := File{
-						Name:     rn,
-						Version:  lamport.Default.Tick(0),
-						Flags:    flags,
-						Modified: info.ModTime().Unix(),
-					}
-					if debug {
-						l.Debugln("dir:", cf, f)
-					}
-					*res = append(*res, f)
+					return nil
 				}
-				return nil
 			}
+
+			var flags uint32 = protocol.FlagDirectory
+			if w.IgnorePerms {
+				flags |= protocol.FlagNoPermBits | 0777
+			} else {
+				flags |= uint32(info.Mode() & os.ModePerm)
+			}
+			f := protocol.FileInfo{
+				Name:     rn,
+				Version:  lamport.Default.Tick(0),
+				Flags:    flags,
+				Modified: info.ModTime().Unix(),
+			}
+			if debug {
+				l.Debugln("dir:", f)
+			}
+			fchan <- f
+			return nil
 		}
 
 		if info.Mode().IsRegular() {
@@ -204,19 +201,19 @@ func (w *Walker) walkAndHashFiles(res *[]File, ign map[string][]string) filepath
 					if debug {
 						l.Debugln("unchanged:", cf)
 					}
-					*res = append(*res, cf)
 					return nil
 				}
 
 				if w.Suppressor != nil {
 					if cur, prev := w.Suppressor.Suppress(rn, info); cur && !prev {
 						l.Infof("Changes to %q are being temporarily suppressed because it changes too frequently.", p)
-						cf.Suppressed = true
-						cf.Version++
+						cf.Flags |= protocol.FlagInvalid
+						cf.Version = lamport.Default.Tick(cf.Version)
+						cf.LocalVersion = 0
 						if debug {
 							l.Debugln("suppressed:", cf)
 						}
-						*res = append(*res, cf)
+						fchan <- cf
 						return nil
 					} else if prev && !cur {
 						l.Infof("Changes to %q are no longer suppressed.", p)
@@ -254,15 +251,14 @@ func (w *Walker) walkAndHashFiles(res *[]File, ign map[string][]string) filepath
 			if w.IgnorePerms {
 				flags = protocol.FlagNoPermBits | 0666
 			}
-			f := File{
+			f := protocol.FileInfo{
 				Name:     rn,
 				Version:  lamport.Default.Tick(0),
-				Size:     info.Size(),
 				Flags:    flags,
 				Modified: info.ModTime().Unix(),
 				Blocks:   blocks,
 			}
-			*res = append(*res, f)
+			fchan <- f
 		}
 
 		return nil
@@ -282,7 +278,7 @@ func (w *Walker) cleanTempFile(path string, info os.FileInfo, err error) error {
 func (w *Walker) ignoreFile(patterns map[string][]string, file string) bool {
 	first, last := filepath.Split(file)
 	for prefix, pats := range patterns {
-		if len(prefix) == 0 || prefix == first || strings.HasPrefix(first, prefix+"/") {
+		if prefix == "." || prefix == first || strings.HasPrefix(first, fmt.Sprintf("%s%c", prefix, os.PathSeparator)) {
 			for _, pattern := range pats {
 				if match, _ := filepath.Match(pattern, last); match {
 					return true

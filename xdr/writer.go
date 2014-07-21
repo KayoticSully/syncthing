@@ -1,6 +1,6 @@
-// Copyright (C) 2014 Jakob Borg and other contributors. All rights reserved.
-// Use of this source code is governed by an MIT-style license that can be
-// found in the LICENSE file.
+// Copyright (C) 2014 Jakob Borg and Contributors (see the CONTRIBUTORS file).
+// All rights reserved. Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
 
 package xdr
 
@@ -25,6 +25,13 @@ type Writer struct {
 	err  error
 	b    [8]byte
 	last time.Time
+}
+
+type AppendWriter []byte
+
+func (w *AppendWriter) Write(bs []byte) (int, error) {
+	*w = append(*w, bs...)
+	return len(bs), nil
 }
 
 func NewWriter(w io.Writer) *Writer {
@@ -69,25 +76,16 @@ func (w *Writer) WriteBytes(bs []byte) (int, error) {
 	return l, w.err
 }
 
+func (w *Writer) WriteBool(v bool) (int, error) {
+	if v {
+		return w.WriteUint32(1)
+	} else {
+		return w.WriteUint32(0)
+	}
+}
+
 func (w *Writer) WriteUint16(v uint16) (int, error) {
-	if w.err != nil {
-		return 0, w.err
-	}
-
-	w.last = time.Now()
-	if debug {
-		dl.Debugf("wr uint16=%d", v)
-	}
-
-	w.b[0] = byte(v >> 8)
-	w.b[1] = byte(v)
-	w.b[2] = 0
-	w.b[3] = 0
-
-	var l int
-	l, w.err = w.w.Write(w.b[:4])
-	w.tot += l
-	return l, w.err
+	return w.WriteUint32(uint32(v))
 }
 
 func (w *Writer) WriteUint32(v uint32) (int, error) {

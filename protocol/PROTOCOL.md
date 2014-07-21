@@ -25,23 +25,16 @@ Transport and Authentication
 ----------------------------
 
 BEP is deployed as the highest level in a protocol stack, with the lower
-level protocols providing compression, encryption and authentication.
+level protocols providing encryption and authentication.
 
     +-----------------------------|
     |   Block Exchange Protocol   |
-    |-----------------------------|
-    |   Compression (RFC 1951)    |
     |-----------------------------|
     | Encryption & Auth (TLS 1.2) |
     |-----------------------------|
     |             TCP             |
     |-----------------------------|
     v             ...             v
-
-Compression is started directly after a successful TLS handshake,
-before the first message is sent. The compression is flushed at each
-message boundary. Compression SHALL use the DEFLATE format as specified
-in RFC 1951.
 
 The encryption and authentication layer SHALL use TLS 1.2 or a higher
 revision. A strong cipher suite SHALL be used, with "strong cipher
@@ -59,10 +52,11 @@ or certificate pinning combined with some out of band first
 verification. The reference implementation uses preshared certificate
 fingerprints (SHA-256) referred to as "Node IDs".
 
-There is no required order or synchronization among BEP messages - any
-message type may be sent at any time and the sender need not await a
-response to one message before sending another. Responses MUST however
-be sent in the same order as the requests are received.
+There is no required order or synchronization among BEP messages except
+as noted per message type - any message type may be sent at any time and
+the sender need not await a response to one message before sending
+another. Responses MUST however be sent in the same order as the
+requests are received.
 
 The underlying transport protocol MUST be TCP.
 
@@ -118,8 +112,9 @@ normalization form C.
 ### Cluster Config (Type = 0)
 
 This informational message provides information about the cluster
-configuration, as it pertains to the current connection. It is sent by
-both sides after connection establishment.
+configuration as it pertains to the current connection. A Cluster Config
+message MUST be the first message sent on a BEP connection. Additional
+Cluster Config messages MUST NOT be sent after the initial exchange.
 
 #### Graphical Representation
 
@@ -185,6 +180,10 @@ both sides after connection establishment.
     /                                                               /
     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
     |                             Flags                             |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                                                               |
+    +                  Max Local Version (64 bits)                  +
+    |                                                               |
     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
 
@@ -256,6 +255,14 @@ The Node Flags field contains the following single bit flags:
 
 Exactly one of the T, R or S bits MUST be set.
 
+The Node Max Local Version field contains the highest local file version
+number of the files already known to be in the index sent by this node.
+If nothing is known about the index of a given node, this field MUST be
+set to zero. When receiving a Cluster Config message with a non-zero Max
+Version for the local node ID, a node MAY elect to send an Index Update
+message containing only files with higher local version numbers in place
+of the initial Index message.
+
 The Options field contain option values to be used in an implementation
 specific manner. The options list is conceptually a map of Key => Value
 items, although it is transmitted in the form of a list of (Key, Value)
@@ -285,6 +292,7 @@ peers acting in a specific manner as a result of sent options.
     struct Node {
         string ID<>;
         unsigned int Flags;
+        unsigned hyper MaxLocalVersion;
     }
 
     struct Option {
@@ -292,14 +300,22 @@ peers acting in a specific manner as a result of sent options.
         string Value<>;
     }
 
-### Index (Type = 1)
+### Index (Type = 1) and Index Update (Type = 6)
 
-The Index message defines the contents of the senders repository. An
-Index message MUST be sent by each node immediately upon connection. A
-node with no data to advertise MUST send an empty Index message (a file
-list of zero length). If the repository contents change from non-empty
-to empty, an empty Index message MUST be sent. There is no response to
-the Index message.
+The Index and Index Update messages define the contents of the senders
+repository. An Index message represents the full contents of the
+repository and thus supersedes any previous index. An Index Update
+amends an existing index with new information, not affecting any entries
+not included in the message. An Index Update MAY NOT be sent unless
+preceded by an Index, unless a non-zero Max Version has been announced
+for the given repository by the peer node.
+
+An Index or Index Update message MUST be sent for each repository
+included in the Cluster Config message, and MUST be sent before any
+other message referring to that repository. A node with no data to
+advertise MUST send an empty Index message (a file list of zero length).
+If the repository contents change from non-empty to empty, an empty
+Index message MUST be sent. There is no response to the Index message.
 
 #### Graphical Representation
 
@@ -343,6 +359,10 @@ the Index message.
     +                       Version (64 bits)                       +
     |                                                               |
     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                                                               |
+    +                    Local Version (64 bits)                    +
+    |                                                               |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
     |                       Number of Blocks                        |
     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
     /                                                               /
@@ -383,6 +403,10 @@ indicating when the change was detected. The clock ticks on every
 detected and received change. The combination of Repository, Name and
 Version uniquely identifies the contents of a file at a given point in
 time.
+
+The Local Version field is the value of a node local monotonic clock at
+the time of last local database update to a file. The clock ticks on
+every local database update.
 
 The Flags field is made up of the following single bit flags:
 
@@ -442,6 +466,7 @@ block which may represent a smaller amount of data.
         unsigned int Flags;
         hyper Modified;
         unsigned hyper Version;
+        unsigned hyper LocalVer;
         BlockInfo Blocks<>;
     }
 
@@ -536,14 +561,6 @@ firewalls and NAT gateways. The Ping message has no contents.
 The Pong message is sent in response to a Ping. The Pong message has no
 contents, but copies the Message ID from the Ping.
 
-### Index Update (Type = 6)
-
-This message has exactly the same structure as the Index message.
-However instead of replacing the contents of the repository in the
-model, the Index Update merely amends it with new or updated file
-information. Any files not mentioned in an Index Update are left
-unchanged.
-
 Sharing Modes
 -------------
 
@@ -582,9 +599,9 @@ restrictive than the following:
 ### Index and Index Update Messages
 
  - Repository: 64 bytes
- - Number of Files: 1.000.000
+ - Number of Files: 10.000.000
  - Name: 1024 bytes
- - Number of Blocks: 100.000
+ - Number of Blocks: 1.000.000
  - Hash: 64 bytes
 
 ### Request Messages
