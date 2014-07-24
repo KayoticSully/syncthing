@@ -84,7 +84,7 @@ func upgrade() error {
 }
 
 func currentRelease() (githubRelease, error) {
-	resp, err := http.Get("https://api.github.com/repos/calmh/syncthing/releases?per_page=1")
+	resp, err := http.Get("https://api.github.com/repos/calmh/syncthing/releases?per_page=10")
 	if err != nil {
 		return githubRelease{}, err
 	}
@@ -93,10 +93,24 @@ func currentRelease() (githubRelease, error) {
 	json.NewDecoder(resp.Body).Decode(&rels)
 	resp.Body.Close()
 
-	if len(rels) != 1 {
-		return githubRelease{}, fmt.Errorf("Unexpected number of releases: %d", len(rels))
+	if strings.Contains(Version, "-beta") {
+		// We are a beta version. Use whatever we can find that is newer-or-equal than current.
+		for _, rel := range rels {
+			if compareVersions(rel.Tag, Version) >= 0 {
+				return rel, nil
+			}
+		}
+		// We found nothing. Return the latest release and let the next layer decide.
+		return rels[0], nil
+	} else {
+		// We are a regular release. Only consider non-prerelease versions for upgrade.
+		for _, rel := range rels {
+			if !rel.Prerelease {
+				return rel, nil
+			}
+		}
+		return githubRelease{}, errors.New("no suitable release found")
 	}
-	return rels[0], nil
 }
 
 func readTarGZ(url string, dir string) (string, error) {

@@ -21,7 +21,7 @@ syncthing.config(function ($httpProvider, $translateProvider) {
     $translateProvider.preferredLanguage('en');
 });
 
-syncthing.controller('SyncthingCtrl', function ($scope, $http, $translate) {
+syncthing.controller('SyncthingCtrl', function ($scope, $http, $translate, $location) {
     var prevDate = 0;
     var getOK = true;
     var restarting = false;
@@ -39,6 +39,13 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http, $translate) {
     $scope.reportData = {};
     $scope.reportPreview = false;
     $scope.upgradeInfo = {};
+
+    $scope.$on("$locationChangeSuccess", function () {
+        var lang = $location.search().lang;
+        if (lang) {
+            $translate.use(lang);
+        }
+    });
 
     $scope.needActions = {
         'rm': 'Del',
@@ -406,7 +413,6 @@ syncthing.controller('SyncthingCtrl', function ($scope, $http, $translate) {
 
         $('#editNode').modal('hide');
         nodeCfg = $scope.currentNode;
-        nodeCfg.NodeID = nodeCfg.NodeID.replace(/ /g, '').replace(/-/g, '').toLowerCase().trim();
         nodeCfg.Addresses = nodeCfg.AddressesStr.split(',').map(function (x) { return x.trim(); });
 
         done = false;
@@ -859,6 +865,7 @@ syncthing.directive('validNodeid', function($http) {
                         if (resp.error) {
                             ctrl.$setValidity('validNodeid', false);
                         } else {
+                            scope.currentNode.NodeID = resp.id;
                             ctrl.$setValidity('validNodeid', true);
                         }
                     });

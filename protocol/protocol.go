@@ -131,7 +131,6 @@ func NewConnection(nodeID NodeID, reader io.Reader, writer io.Writer, receiver M
 		closed:   make(chan struct{}),
 	}
 
-	go c.indexSerializerLoop()
 	go c.readerLoop()
 	go c.writerLoop()
 	go c.pingerLoop()
@@ -307,51 +306,16 @@ func (c *rawConnection) readerLoop() (err error) {
 	}
 }
 
-type incomingIndex struct {
-	update bool
-	id     NodeID
-	repo   string
-	files  []FileInfo
-}
-
-var incomingIndexes = make(chan incomingIndex, 100) // should be enough for anyone, right?
-
-func (c *rawConnection) indexSerializerLoop() {
-	// We must avoid blocking the reader loop when processing large indexes.
-	// There is otherwise a potential deadlock where both sides has the model
-	// locked because it's sending a large index update and can't receive the
-	// large index update from the other side. But we must also ensure to
-	// process the indexes in the order they are received, hence the separate
-	// routine and buffered channel.
-	for {
-		select {
-		case ii := <-incomingIndexes:
-			if ii.update {
-				c.receiver.IndexUpdate(ii.id, ii.repo, ii.files)
-			} else {
-				c.receiver.Index(ii.id, ii.repo, ii.files)
-			}
-		case <-c.closed:
-			return
-		}
-	}
-}
-
 func (c *rawConnection) handleIndex() error {
 	var im IndexMessage
 	im.decodeXDR(c.xr)
 	if err := c.xr.Error(); err != nil {
 		return err
 	} else {
-
-		// We run this (and the corresponding one for update, below)
-		// in a separate goroutine to avoid blocking the read loop.
-		// There is otherwise a potential deadlock where both sides
-		// has the model locked because it's sending a large index
-		// update and can't receive the large index update from the
-		// other side.
-
-		incomingIndexes <- incomingIndex{false, c.id, im.Repository, im.Files}
+		if debug {
+			l.Debugf("Index(%v, %v, %d files)", c.id, im.Repository, len(im.Files))
+		}
+		c.receiver.Index(c.id, im.Repository, im.Files)
 	}
 	return nil
 }
@@ -362,7 +326,10 @@ func (c *rawConnection) handleIndexUpdate() error {
 	if err := c.xr.Error(); err != nil {
 		return err
 	} else {
-		incomingIndexes <- incomingIndex{true, c.id, im.Repository, im.Files}
+		if debug {
+			l.Debugf("queueing IndexUpdate(%v, %v, %d files)", c.id, im.Repository, len(im.Files))
+		}
+		c.receiver.IndexUpdate(c.id, im.Repository, im.Files)
 	}
 	return nil
 }

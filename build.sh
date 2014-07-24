@@ -22,11 +22,12 @@ check() {
 build() {
 	check
 	godep go build $* -ldflags "$ldflags" ./cmd/syncthing
+	godep go build $* -ldflags "$ldflags" ./cmd/discosrv
 }
 
 assets() {
 	check
-	godep go run cmd/assets/assets.go gui > auto/gui.files.go
+	godep go run cmd/genassets/main.go gui > auto/gui.files.go
 }
 
 test-cov() {
@@ -85,7 +86,7 @@ zipDist() {
 
 deps() {
 	check
-	godep save ./cmd/syncthing ./cmd/assets ./discover/cmd/discosrv
+	godep save ./cmd/...
 }
 
 setup() {
@@ -97,14 +98,15 @@ setup() {
 
 xdr() {
 	for f in discover/packets files/leveldb protocol/message ; do
-		go run xdr/cmd/genxdr/main.go -- "${f}.go" > "${f}_xdr.go"
+		go run cmd/genxdr/main.go -- "${f}.go" > "${f}_xdr.go"
 	done
 }
 
 case "$1" in
 	"")
 		shift
-		build $*
+		export GOBIN=$(pwd)/bin
+		godep go install $* -ldflags "$ldflags" ./cmd/...
 		;;
 
 	race)
@@ -140,8 +142,6 @@ case "$1" in
 		rm -f *.tar.gz *.zip
 		test || exit 1
 		assets
-
-		godep go build ./discover/cmd/discosrv
 
 		for os in darwin-amd64 linux-386 linux-amd64 freebsd-amd64 windows-amd64 windows-386 ; do
 			export GOOS=${os%-*}
